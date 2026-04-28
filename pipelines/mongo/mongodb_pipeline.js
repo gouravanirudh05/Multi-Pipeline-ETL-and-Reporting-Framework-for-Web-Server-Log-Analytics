@@ -4,7 +4,7 @@
 // npm init -y
 // npm install mongodb pg
 // package.json -> "type": "module"
-// node mongodb_pipeline.js <log_file_path_or_json_array> <batch_size> <run_id> <run_uuid>
+// node mongodb_pipeline.js <log_file_path_or_json_array> <batch_size> <run_uuid>
 
 import fs from "fs";
 import readline from "readline";
@@ -95,9 +95,8 @@ function parseLogLine(line) {
 async function initializePostgres(pgClient) {
   await pgClient.query(`
     CREATE TABLE IF NOT EXISTS etl_runs (
-      run_id SERIAL PRIMARY KEY,
+      run_uuid VARCHAR(64) PRIMARY KEY,
       pipeline VARCHAR(20),
-      run_uuid VARCHAR(64) UNIQUE,
       batch_size INTEGER,
       total_records INTEGER,
       total_batches INTEGER,
@@ -113,7 +112,6 @@ async function initializePostgres(pgClient) {
   await pgClient.query(`
     CREATE TABLE IF NOT EXISTS daily_traffic (
       id SERIAL PRIMARY KEY,
-      run_id INTEGER,
       pipeline VARCHAR(20),
       run_uuid VARCHAR(64),
       batch_id INTEGER,
@@ -128,7 +126,6 @@ async function initializePostgres(pgClient) {
   await pgClient.query(`
     CREATE TABLE IF NOT EXISTS top_resources (
       id SERIAL PRIMARY KEY,
-      run_id INTEGER,
       pipeline VARCHAR(20),
       run_uuid VARCHAR(64),
       batch_id INTEGER,
@@ -143,7 +140,6 @@ async function initializePostgres(pgClient) {
   await pgClient.query(`
     CREATE TABLE IF NOT EXISTS hourly_errors (
       id SERIAL PRIMARY KEY,
-      run_id INTEGER,
       pipeline VARCHAR(20),
       run_uuid VARCHAR(64),
       batch_id INTEGER,
@@ -183,7 +179,6 @@ async function processBatch(
 // Run required analytics over the full run
 // ----------------------
 async function writeFinalAggregates(
-  runId,
   runUuid,
   pipeline,
   totalBatches,
@@ -229,11 +224,10 @@ async function writeFinalAggregates(
     await pgClient.query(
       `
       INSERT INTO daily_traffic
-      (run_id, pipeline, run_uuid, batch_id, log_date, status_code, request_count, total_bytes)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      (pipeline, run_uuid, batch_id, log_date, status_code, request_count, total_bytes)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
       `,
       [
-        runId,
         pipeline,
         runUuid,
         resultBatchId,
@@ -280,11 +274,10 @@ async function writeFinalAggregates(
     await pgClient.query(
       `
       INSERT INTO top_resources
-      (run_id, pipeline, run_uuid, batch_id, resource_path, request_count, total_bytes, distinct_host_count)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      (pipeline, run_uuid, batch_id, resource_path, request_count, total_bytes, distinct_host_count)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
       `,
       [
-        runId,
         pipeline,
         runUuid,
         resultBatchId,
@@ -370,11 +363,10 @@ async function writeFinalAggregates(
     await pgClient.query(
       `
       INSERT INTO hourly_errors
-      (run_id, pipeline, run_uuid, batch_id, log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      (pipeline, run_uuid, batch_id, log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       `,
       [
-        runId,
         pipeline,
         runUuid,
         resultBatchId,
@@ -407,7 +399,7 @@ function parseLogFilePaths(rawArg) {
   return [rawArg];
 }
 
-async function runPipeline(logFilePaths, batchSize, runId, runUuid, pipeline) {
+async function runPipeline(logFilePaths, batchSize, runUuid, pipeline) {
   const startTime = Date.now();
 
   console.log(`
@@ -494,7 +486,6 @@ async function runPipeline(logFilePaths, batchSize, runId, runUuid, pipeline) {
   }
 
   await writeFinalAggregates(
-    runId,
     runUuid,
     pipeline,
     totalBatches,
@@ -517,7 +508,7 @@ async function runPipeline(logFilePaths, batchSize, runId, runUuid, pipeline) {
         runtime_seconds = $5,
         status = $6,
         completed_at = NOW()
-    WHERE run_id = $7
+    WHERE run_uuid = $7
     `,
     [
       totalRecords,
@@ -526,7 +517,7 @@ async function runPipeline(logFilePaths, batchSize, runId, runUuid, pipeline) {
       malformedRecords,
       runtimeSeconds,
       "completed",
-      runId,
+      runUuid,
     ]
   );
 
@@ -552,19 +543,18 @@ async function runPipeline(logFilePaths, batchSize, runId, runUuid, pipeline) {
 // ----------------------
 const args = process.argv.slice(2);
 
-if (args.length < 4) {
+if (args.length < 3) {
   console.error(
-    "Usage: node mongodb_pipeline.js <log_file_path_or_json_array> <batch_size> <run_id> <run_uuid>"
+    "Usage: node mongodb_pipeline.js <log_file_path_or_json_array> <batch_size> <run_uuid>"
   );
   process.exit(1);
 }
 
-const [logFilePathArg, batchSize, runIdArg, runUuid] = args;
+const [logFilePathArg, batchSize, runUuid] = args;
 const logFilePaths = parseLogFilePaths(logFilePathArg);
-const runId = parseInt(runIdArg);
 const pipeline = "mongodb";
 
-runPipeline(logFilePaths, parseInt(batchSize), runId, runUuid, pipeline).catch(
+runPipeline(logFilePaths, parseInt(batchSize), runUuid, pipeline).catch(
   (err) => {
     console.error("Pipeline failed:", err);
     process.exit(1);

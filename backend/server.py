@@ -33,6 +33,28 @@ DB_CONFIG = {
 def get_conn():
     return psycopg2.connect(**DB_CONFIG)
 
+def initialize_postgres():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS etl_runs (
+            run_uuid VARCHAR(64) PRIMARY KEY,
+            pipeline VARCHAR(20),
+            batch_size INTEGER,
+            total_records INTEGER,
+            total_batches INTEGER,
+            avg_batch_size NUMERIC(10,2),
+            malformed_count INTEGER,
+            runtime_seconds NUMERIC(10,3),
+            status VARCHAR(20),
+            started_at TIMESTAMPTZ,
+            completed_at TIMESTAMPTZ
+        )
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+
 # ============ STATUS ============
 @app.get("/api/status")
 def status():
@@ -65,6 +87,7 @@ async def run_pipeline(req: Request):
     ]
 
     # Create run entry in database
+    initialize_postgres()
     conn = get_conn()
     cur = conn.cursor()
 
@@ -73,10 +96,8 @@ async def run_pipeline(req: Request):
             INSERT INTO etl_runs 
             (pipeline, run_uuid, batch_size, status, started_at)
             VALUES (%s, %s, %s, %s, NOW())
-            RETURNING run_id
         """, (pipeline, run_uuid, batch_size, "running"))
 
-        run_id = cur.fetchone()[0]
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -94,7 +115,6 @@ async def run_pipeline(req: Request):
             os.path.join(PROJECT_ROOT, "pipelines", "mongo","mongodb_pipeline.js"),
             json.dumps(log_file_paths),
             str(batch_size),
-            str(run_id),
             run_uuid
         ]
     elif pipeline == "pig":
@@ -135,8 +155,8 @@ async def run_pipeline(req: Request):
                 cur.execute("""
                     UPDATE etl_runs 
                     SET status = %s, completed_at = NOW()
-                    WHERE run_id = %s
-                """, ("completed", run_id))
+                    WHERE run_uuid = %s
+                """, ("completed", run_uuid))
                 conn.commit()
                 cur.close()
                 conn.close()
@@ -149,8 +169,8 @@ async def run_pipeline(req: Request):
                 cur.execute("""
                     UPDATE etl_runs 
                     SET status = %s, completed_at = NOW()
-                    WHERE run_id = %s
-                """, ("failed", run_id))
+                    WHERE run_uuid = %s
+                """, ("failed", run_uuid))
                 conn.commit()
                 cur.close()
                 conn.close()
@@ -165,8 +185,8 @@ async def run_pipeline(req: Request):
                 cur.execute("""
                     UPDATE etl_runs 
                     SET status = %s, completed_at = NOW()
-                    WHERE run_id = %s
-                """, ("failed", run_id))
+                    WHERE run_uuid = %s
+                """, ("failed", run_uuid))
                 conn.commit()
                 cur.close()
                 conn.close()
@@ -187,7 +207,7 @@ def get_results(run_uuid: str):
         # Get run metadata
         cur.execute("""
             SELECT 
-                run_id, pipeline, run_uuid, batch_size, 
+                pipeline, run_uuid, batch_size, 
                 total_records, total_batches, avg_batch_size, 
                 malformed_count, runtime_seconds, status, 
                 started_at, completed_at
@@ -255,7 +275,7 @@ def get_runs():
     try:
         cur.execute("""
             SELECT 
-                run_id, pipeline, run_uuid, batch_size,
+                pipeline, run_uuid, batch_size,
                 total_records, total_batches, avg_batch_size,
                 malformed_count, runtime_seconds, status,
                 started_at, completed_at

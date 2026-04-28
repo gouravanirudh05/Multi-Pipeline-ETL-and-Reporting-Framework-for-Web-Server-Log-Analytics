@@ -607,9 +607,8 @@
       <div style="overflow-y:auto; padding:24px; font-family:var(--mono); font-size:12px; line-height:1.8; color:#475569; flex:1;">
 <pre style="color:#334155;">
 <span style="color:#2563eb;">TABLE</span> etl_runs
-  run_id           SERIAL PK
   pipeline         VARCHAR(20)    -- pig | mapreduce | mongodb | hive
-  run_uuid         VARCHAR(64)    UNIQUE
+  run_uuid         VARCHAR(64)    PRIMARY KEY
   batch_size       INTEGER
   total_records    INTEGER
   total_batches    INTEGER
@@ -622,7 +621,6 @@
 
 <span style="color:#2563eb;">TABLE</span> daily_traffic
   id               SERIAL PK
-  run_id           INTEGER FK -> etl_runs
   pipeline         VARCHAR(20)
   run_uuid         VARCHAR(64)
   batch_id         INTEGER
@@ -634,7 +632,6 @@
 
 <span style="color:#2563eb;">TABLE</span> top_resources
   id                    SERIAL PK
-  run_id                INTEGER FK -> etl_runs
   pipeline              VARCHAR(20)
   run_uuid              VARCHAR(64)
   batch_id              INTEGER
@@ -646,7 +643,6 @@
 
 <span style="color:#2563eb;">TABLE</span> hourly_errors
   id                    SERIAL PK
-  run_id                INTEGER FK -> etl_runs
   pipeline              VARCHAR(20)
   run_uuid              VARCHAR(64)
   batch_id              INTEGER
