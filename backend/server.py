@@ -59,7 +59,10 @@ async def run_pipeline(req: Request):
 
     # Generate UUID for this run
     run_uuid = str(uuid_lib.uuid4())
-    log_file = os.path.join(PROJECT_ROOT, log_files[0])
+    log_file_paths = [
+        path if os.path.isabs(path) else os.path.join(PROJECT_ROOT, path)
+        for path in log_files
+    ]
 
     # Create run entry in database
     conn = get_conn()
@@ -89,7 +92,7 @@ async def run_pipeline(req: Request):
         cmd = [
             "node",
             os.path.join(PROJECT_ROOT, "pipelines", "mongo","mongodb_pipeline.js"),
-            log_file,
+            json.dumps(log_file_paths),
             str(batch_size),
             str(run_id),
             run_uuid

@@ -4,7 +4,7 @@
 // npm init -y
 // npm install mongodb pg
 // package.json -> "type": "module"
-// node mongodb_pipeline.js <log_file_path> <batch_size> <run_id> <run_uuid>
+// node mongodb_pipeline.js <log_file_path_or_json_array> <batch_size> <run_id> <run_uuid>
 
 import fs from "fs";
 import readline from "readline";
@@ -159,42 +159,70 @@ async function initializePostgres(pgClient) {
 }
 
 // ----------------------
-// Process one batch
+// Insert one parsed batch into MongoDB
 // ----------------------
 async function processBatch(
   batch,
   batchId,
+  runUuid,
+  logsCollection
+) {
+  console.log(`[Batch ${batchId}] Loading ${batch.length} records...`);
+
+  const rows = batch.map((row) => ({
+    ...row,
+    run_uuid: runUuid,
+    batch_id: batchId,
+  }));
+
+  await logsCollection.insertMany(rows);
+  console.log(`[Batch ${batchId}] Loaded`);
+}
+
+// ----------------------
+// Run required analytics over the full run
+// ----------------------
+async function writeFinalAggregates(
   runId,
   runUuid,
   pipeline,
+  totalBatches,
   logsCollection,
   pgClient
 ) {
-  console.log(`[Batch ${batchId}] Processing ${batch.length} records...`);
+  const resultBatchId = totalBatches;
 
-  // Clear previous batch
-  await logsCollection.deleteMany({});
-
-  // Insert current batch
-  await logsCollection.insertMany(batch);
+  await pgClient.query("DELETE FROM daily_traffic WHERE run_uuid = $1", [
+    runUuid,
+  ]);
+  await pgClient.query("DELETE FROM top_resources WHERE run_uuid = $1", [
+    runUuid,
+  ]);
+  await pgClient.query("DELETE FROM hourly_errors WHERE run_uuid = $1", [
+    runUuid,
+  ]);
 
   // ----------------------
   // Query 1: Daily Traffic Summary
   // ----------------------
-  console.log(`[Batch ${batchId}] Running Q1 (Daily Traffic)...`);
+  console.log("Running Q1 (Daily Traffic) over full run...");
   const dailySummary = await logsCollection
-    .aggregate([
-      {
-        $group: {
-          _id: {
-            log_date: "$log_date",
-            status_code: "$status_code",
+    .aggregate(
+      [
+        { $match: { run_uuid: runUuid } },
+        {
+          $group: {
+            _id: {
+              log_date: "$log_date",
+              status_code: "$status_code",
+            },
+            request_count: { $sum: 1 },
+            total_bytes: { $sum: "$bytes_transferred" },
           },
-          request_count: { $sum: 1 },
-          total_bytes: { $sum: "$bytes_transferred" },
         },
-      },
-    ])
+      ],
+      { allowDiskUse: true }
+    )
     .toArray();
 
   for (const row of dailySummary) {
@@ -208,7 +236,7 @@ async function processBatch(
         runId,
         pipeline,
         runUuid,
-        batchId,
+        resultBatchId,
         row._id.log_date,
         row._id.status_code,
         row.request_count,
@@ -220,28 +248,32 @@ async function processBatch(
   // ----------------------
   // Query 2: Top Requested Resources
   // ----------------------
-  console.log(`[Batch ${batchId}] Running Q2 (Top Resources)...`);
+  console.log("Running Q2 (Top Resources) over full run...");
   const topResources = await logsCollection
-    .aggregate([
-      {
-        $group: {
-          _id: "$resource_path",
-          request_count: { $sum: 1 },
-          total_bytes: { $sum: "$bytes_transferred" },
-          distinct_hosts: { $addToSet: "$host" },
+    .aggregate(
+      [
+        { $match: { run_uuid: runUuid } },
+        {
+          $group: {
+            _id: "$resource_path",
+            request_count: { $sum: 1 },
+            total_bytes: { $sum: "$bytes_transferred" },
+            distinct_hosts: { $addToSet: "$host" },
+          },
         },
-      },
-      {
-        $project: {
-          resource_path: "$_id",
-          request_count: 1,
-          total_bytes: 1,
-          distinct_host_count: { $size: "$distinct_hosts" },
+        {
+          $project: {
+            resource_path: "$_id",
+            request_count: 1,
+            total_bytes: 1,
+            distinct_host_count: { $size: "$distinct_hosts" },
+          },
         },
-      },
-      { $sort: { request_count: -1 } },
-      { $limit: 20 },
-    ])
+        { $sort: { request_count: -1, resource_path: 1 } },
+        { $limit: 20 },
+      ],
+      { allowDiskUse: true }
+    )
     .toArray();
 
   for (const row of topResources) {
@@ -255,7 +287,7 @@ async function processBatch(
         runId,
         pipeline,
         runUuid,
-        batchId,
+        resultBatchId,
         row.resource_path,
         row.request_count,
         row.total_bytes,
@@ -267,67 +299,71 @@ async function processBatch(
   // ----------------------
   // Query 3: Hourly Error Analysis
   // ----------------------
-  console.log(`[Batch ${batchId}] Running Q3 (Hourly Errors)...`);
+  console.log("Running Q3 (Hourly Errors) over full run...");
   const hourlyErrors = await logsCollection
-    .aggregate([
-      {
-        $group: {
-          _id: {
-            log_date: "$log_date",
-            log_hour: "$log_hour",
-          },
-          total_requests: { $sum: 1 },
-          error_requests: {
-            $sum: {
-              $cond: [
-                {
-                  $and: [
-                    { $gte: ["$status_code", 400] },
-                    { $lte: ["$status_code", 599] },
-                  ],
-                },
-                1,
-                0,
-              ],
+    .aggregate(
+      [
+        { $match: { run_uuid: runUuid } },
+        {
+          $group: {
+            _id: {
+              log_date: "$log_date",
+              log_hour: "$log_hour",
             },
-          },
-          error_hosts: {
-            $addToSet: {
-              $cond: [
-                {
-                  $and: [
-                    { $gte: ["$status_code", 400] },
-                    { $lte: ["$status_code", 599] },
-                  ],
-                },
-                "$host",
-                "$$REMOVE",
-              ],
-            },
-          },
-        },
-      },
-      {
-        $project: {
-          log_date: "$_id.log_date",
-          log_hour: "$_id.log_hour",
-          total_requests: 1,
-          error_requests: 1,
-          error_rate: {
-            $cond: [
-              { $eq: ["$total_requests", 0] },
-              0,
-              {
-                $divide: ["$error_requests", "$total_requests"],
+            total_requests: { $sum: 1 },
+            error_requests: {
+              $sum: {
+                $cond: [
+                  {
+                    $and: [
+                      { $gte: ["$status_code", 400] },
+                      { $lte: ["$status_code", 599] },
+                    ],
+                  },
+                  1,
+                  0,
+                ],
               },
-            ],
-          },
-          distinct_error_hosts: {
-            $size: "$error_hosts",
+            },
+            error_hosts: {
+              $addToSet: {
+                $cond: [
+                  {
+                    $and: [
+                      { $gte: ["$status_code", 400] },
+                      { $lte: ["$status_code", 599] },
+                    ],
+                  },
+                  "$host",
+                  "$$REMOVE",
+                ],
+              },
+            },
           },
         },
-      },
-    ])
+        {
+          $project: {
+            log_date: "$_id.log_date",
+            log_hour: "$_id.log_hour",
+            total_requests: 1,
+            error_requests: 1,
+            error_rate: {
+              $cond: [
+                { $eq: ["$total_requests", 0] },
+                0,
+                {
+                  $divide: ["$error_requests", "$total_requests"],
+                },
+              ],
+            },
+            distinct_error_hosts: {
+              $size: "$error_hosts",
+            },
+          },
+        },
+      ],
+      { allowDiskUse: true }
+    )
     .toArray();
 
   for (const row of hourlyErrors) {
@@ -341,7 +377,7 @@ async function processBatch(
         runId,
         pipeline,
         runUuid,
-        batchId,
+        resultBatchId,
         row.log_date,
         row.log_hour,
         row.error_requests,
@@ -352,13 +388,26 @@ async function processBatch(
     );
   }
 
-  console.log(`[Batch ${batchId}] ✓ Completed`);
+  console.log(
+    `Final aggregates written to PostgreSQL after ${totalBatches} source batches`
+  );
 }
 
 // ----------------------
 // Main Pipeline
 // ----------------------
-async function runPipeline(logFilePath, batchSize, runId, runUuid, pipeline) {
+function parseLogFilePaths(rawArg) {
+  try {
+    const parsed = JSON.parse(rawArg);
+    if (Array.isArray(parsed)) return parsed;
+  } catch {
+    // Keep backward-compatible single-file CLI usage.
+  }
+
+  return [rawArg];
+}
+
+async function runPipeline(logFilePaths, batchSize, runId, runUuid, pipeline) {
   const startTime = Date.now();
 
   console.log(`
@@ -380,6 +429,9 @@ async function runPipeline(logFilePath, batchSize, runId, runUuid, pipeline) {
   await pgClient.connect();
   await initializePostgres(pgClient);
 
+  // Clear any stale records for this run UUID before loading.
+  await logsCollection.deleteMany({ run_uuid: runUuid });
+
   let batch = [];
   let batchId = 1;
   let malformedRecords = 0;
@@ -387,40 +439,45 @@ async function runPipeline(logFilePath, batchSize, runId, runUuid, pipeline) {
   let validRecords = 0;
   let totalBatches = 0;
 
-  const rl = readline.createInterface({
-    input: fs.createReadStream(logFilePath),
-    crlfDelay: Infinity,
-  });
+  console.log(`Files to process: ${logFilePaths.length}`);
 
-  console.log(`Reading from: ${logFilePath}`);
-
-  for await (const line of rl) {
-    totalRecords++;
-
-    const parsed = parseLogLine(line);
-
-    if (!parsed) {
-      malformedRecords++;
-      continue;
+  for (const logFilePath of logFilePaths) {
+    if (!fs.existsSync(logFilePath)) {
+      throw new Error(`Log file not found: ${logFilePath}`);
     }
 
-    validRecords++;
-    batch.push(parsed);
+    const rl = readline.createInterface({
+      input: fs.createReadStream(logFilePath),
+      crlfDelay: Infinity,
+    });
 
-    if (batch.length >= batchSize) {
-      await processBatch(
-        batch,
-        batchId,
-        runId,
-        runUuid,
-        pipeline,
-        logsCollection,
-        pgClient
-      );
+    console.log(`Reading from: ${logFilePath}`);
 
-      totalBatches++;
-      batchId++;
-      batch = [];
+    for await (const line of rl) {
+      totalRecords++;
+
+      const parsed = parseLogLine(line);
+
+      if (!parsed) {
+        malformedRecords++;
+        continue;
+      }
+
+      validRecords++;
+      batch.push(parsed);
+
+      if (batch.length >= batchSize) {
+        await processBatch(
+          batch,
+          batchId,
+          runUuid,
+          logsCollection
+        );
+
+        totalBatches++;
+        batchId++;
+        batch = [];
+      }
     }
   }
 
@@ -429,19 +486,25 @@ async function runPipeline(logFilePath, batchSize, runId, runUuid, pipeline) {
     await processBatch(
       batch,
       batchId,
-      runId,
       runUuid,
-      pipeline,
-      logsCollection,
-      pgClient
+      logsCollection
     );
 
     totalBatches++;
   }
 
+  await writeFinalAggregates(
+    runId,
+    runUuid,
+    pipeline,
+    totalBatches,
+    logsCollection,
+    pgClient
+  );
+
   const runtimeSeconds = (Date.now() - startTime) / 1000;
   const avgBatchSize =
-    totalBatches > 0 ? validRecords / totalBatches : 0;
+    totalBatches > 0 ? totalRecords / totalBatches : 0;
 
   // Update final metadata
   await pgClient.query(
@@ -491,16 +554,17 @@ const args = process.argv.slice(2);
 
 if (args.length < 4) {
   console.error(
-    "Usage: node mongodb_pipeline.js <log_file_path> <batch_size> <run_id> <run_uuid>"
+    "Usage: node mongodb_pipeline.js <log_file_path_or_json_array> <batch_size> <run_id> <run_uuid>"
   );
   process.exit(1);
 }
 
-const [logFilePath, batchSize, runIdArg, runUuid] = args;
+const [logFilePathArg, batchSize, runIdArg, runUuid] = args;
+const logFilePaths = parseLogFilePaths(logFilePathArg);
 const runId = parseInt(runIdArg);
 const pipeline = "mongodb";
 
-runPipeline(logFilePath, parseInt(batchSize), runId, runUuid, pipeline).catch(
+runPipeline(logFilePaths, parseInt(batchSize), runId, runUuid, pipeline).catch(
   (err) => {
     console.error("Pipeline failed:", err);
     process.exit(1);
