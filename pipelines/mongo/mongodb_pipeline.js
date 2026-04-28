@@ -111,7 +111,7 @@ async function initializePostgres(pgClient) {
   `);
 
   await pgClient.query(`
-    CREATE TABLE IF NOT EXISTS q1_daily_traffic (
+    CREATE TABLE IF NOT EXISTS daily_traffic (
       id SERIAL PRIMARY KEY,
       run_id INTEGER,
       pipeline VARCHAR(20),
@@ -126,7 +126,7 @@ async function initializePostgres(pgClient) {
   `);
 
   await pgClient.query(`
-    CREATE TABLE IF NOT EXISTS q2_top_resources (
+    CREATE TABLE IF NOT EXISTS top_resources (
       id SERIAL PRIMARY KEY,
       run_id INTEGER,
       pipeline VARCHAR(20),
@@ -141,7 +141,7 @@ async function initializePostgres(pgClient) {
   `);
 
   await pgClient.query(`
-    CREATE TABLE IF NOT EXISTS q3_hourly_errors (
+    CREATE TABLE IF NOT EXISTS hourly_errors (
       id SERIAL PRIMARY KEY,
       run_id INTEGER,
       pipeline VARCHAR(20),
@@ -200,7 +200,7 @@ async function processBatch(
   for (const row of dailySummary) {
     await pgClient.query(
       `
-      INSERT INTO q1_daily_traffic
+      INSERT INTO daily_traffic
       (run_id, pipeline, run_uuid, batch_id, log_date, status_code, request_count, total_bytes)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       `,
@@ -247,7 +247,7 @@ async function processBatch(
   for (const row of topResources) {
     await pgClient.query(
       `
-      INSERT INTO q2_top_resources
+      INSERT INTO top_resources
       (run_id, pipeline, run_uuid, batch_id, resource_path, request_count, total_bytes, distinct_host_count)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       `,
@@ -333,7 +333,7 @@ async function processBatch(
   for (const row of hourlyErrors) {
     await pgClient.query(
       `
-      INSERT INTO q3_hourly_errors
+      INSERT INTO hourly_errors
       (run_id, pipeline, run_uuid, batch_id, log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
       `,

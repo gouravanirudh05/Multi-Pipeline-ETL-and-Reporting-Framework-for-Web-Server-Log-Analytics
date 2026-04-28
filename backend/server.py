@@ -88,7 +88,7 @@ async def run_pipeline(req: Request):
     if pipeline == "mongodb":
         cmd = [
             "node",
-            os.path.join(PROJECT_ROOT, "pipelines", "mongodb_pipeline.js"),
+            os.path.join(PROJECT_ROOT, "pipelines", "mongo","mongodb_pipeline.js"),
             log_file,
             str(batch_size),
             str(run_id),
@@ -201,7 +201,7 @@ def get_results(run_uuid: str):
         # Get Q1 results
         cur.execute("""
             SELECT log_date, status_code, request_count, total_bytes
-            FROM q1_daily_traffic 
+            FROM daily_traffic 
             WHERE run_uuid = %s
             ORDER BY log_date DESC
             LIMIT 50
@@ -211,7 +211,7 @@ def get_results(run_uuid: str):
         # Get Q2 results
         cur.execute("""
             SELECT resource_path, request_count, total_bytes, distinct_host_count
-            FROM q2_top_resources 
+            FROM top_resources 
             WHERE run_uuid = %s
             ORDER BY request_count DESC
             LIMIT 20
@@ -221,7 +221,7 @@ def get_results(run_uuid: str):
         # Get Q3 results
         cur.execute("""
             SELECT log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts
-            FROM q3_hourly_errors 
+            FROM hourly_errors 
             WHERE run_uuid = %s
             ORDER BY log_date DESC, log_hour DESC
             LIMIT 50
