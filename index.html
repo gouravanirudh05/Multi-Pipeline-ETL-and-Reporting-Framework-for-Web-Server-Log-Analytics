@@ -1,0 +1,860 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>ETL Pipeline Runner — NASA Log Analytics</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet"/>
+<style>
+  /* ── Reset & Base ─────────────────────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #0a0c10;
+    --surface:   #111318;
+    --surface2:  #181c24;
+    --border:    #232830;
+    --border2:   #2e3540;
+    --text:      #e4e8f0;
+    --muted:     #6b7585;
+    --pig:       #ff6b35;
+    --mr:        #4fc3f7;
+    --mongo:     #57c97d;
+    --hive:      #ffd54f;
+    --error:     #ff5252;
+    --success:   #69f0ae;
+    --radius:    10px;
+    --mono:      'JetBrains Mono', monospace;
+    --display:   'Syne', sans-serif;
+  }
+
+  html { scroll-behavior: smooth; }
+  body {
+    font-family: var(--display);
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ── Header ───────────────────────────────────────────────────────── */
+  header {
+    padding: 24px 40px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--surface);
+  }
+  .logo {
+    display: flex; align-items: center; gap: 12px;
+  }
+  .logo-icon {
+    width: 36px; height: 36px;
+    background: linear-gradient(135deg, #4fc3f7, #57c97d);
+    border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px;
+  }
+  .logo-text { font-size: 16px; font-weight: 700; letter-spacing: -0.3px; }
+  .logo-sub  { font-size: 11px; color: var(--muted); font-family: var(--mono); margin-top: 1px; }
+  #db-badge {
+    font-family: var(--mono); font-size: 11px;
+    padding: 4px 12px; border-radius: 20px;
+    border: 1px solid var(--border2);
+    color: var(--muted);
+    transition: all .3s;
+  }
+  #db-badge.ok    { border-color: var(--success); color: var(--success); }
+  #db-badge.error { border-color: var(--error);   color: var(--error); }
+
+  /* ── Main Layout ──────────────────────────────────────────────────── */
+  main {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 380px 1fr;
+    grid-template-rows: 1fr;
+    gap: 0;
+    height: calc(100vh - 73px);
+    overflow: hidden;
+  }
+
+  /* ── Left Panel ───────────────────────────────────────────────────── */
+  .left-panel {
+    border-right: 1px solid var(--border);
+    background: var(--surface);
+    overflow-y: auto;
+    padding: 28px 24px;
+    display: flex; flex-direction: column; gap: 24px;
+  }
+
+  .section-label {
+    font-size: 10px; font-weight: 700; letter-spacing: 1.5px;
+    text-transform: uppercase; color: var(--muted);
+    margin-bottom: 12px;
+  }
+
+  /* ── Pipeline Cards ───────────────────────────────────────────────── */
+  .pipeline-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+  .pipeline-card {
+    position: relative;
+    border: 1.5px solid var(--border2);
+    border-radius: var(--radius);
+    padding: 16px 14px;
+    cursor: pointer;
+    transition: all .2s;
+    background: var(--surface2);
+    user-select: none;
+  }
+  .pipeline-card:hover { border-color: var(--border2); background: #1e2330; }
+  .pipeline-card.selected { background: #1a2035; }
+  .pipeline-card.pig.selected     { border-color: var(--pig); box-shadow: 0 0 0 1px var(--pig)20; }
+  .pipeline-card.mapreduce.selected { border-color: var(--mr); box-shadow: 0 0 0 1px var(--mr)20; }
+  .pipeline-card.mongodb.selected { border-color: var(--mongo); box-shadow: 0 0 0 1px var(--mongo)20; }
+  .pipeline-card.hive.selected    { border-color: var(--hive); box-shadow: 0 0 0 1px var(--hive)20; }
+
+  .card-emoji { font-size: 24px; margin-bottom: 6px; display: block; }
+  .card-name  { font-size: 13px; font-weight: 700; }
+  .card-desc  { font-size: 10px; color: var(--muted); margin-top: 3px; font-family: var(--mono); }
+  .card-check {
+    position: absolute; top: 8px; right: 8px;
+    width: 16px; height: 16px; border-radius: 50%;
+    border: 1.5px solid var(--border2);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 9px;
+    transition: all .2s;
+  }
+  .pipeline-card.selected .card-check {
+    background: currentColor; border-color: currentColor; color: white;
+    font-size: 10px;
+  }
+  .pipeline-card.pig .card-check       { color: var(--pig); }
+  .pipeline-card.mapreduce .card-check { color: var(--mr); }
+  .pipeline-card.mongodb .card-check   { color: var(--mongo); }
+  .pipeline-card.hive .card-check      { color: var(--hive); }
+
+  /* ── Config Form ──────────────────────────────────────────────────── */
+  .form-group { display: flex; flex-direction: column; gap: 6px; }
+  .form-label { font-size: 11px; color: var(--muted); font-family: var(--mono); }
+  .form-input {
+    background: var(--surface2);
+    border: 1.5px solid var(--border2);
+    border-radius: 7px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 9px 12px;
+    outline: none;
+    transition: border-color .2s;
+    width: 100%;
+  }
+  .form-input:focus { border-color: #4fc3f7; }
+  .form-input::placeholder { color: var(--muted); }
+
+  textarea.form-input {
+    resize: vertical; min-height: 72px;
+    line-height: 1.5;
+  }
+
+  /* ── Run Button ───────────────────────────────────────────────────── */
+  #run-btn {
+    width: 100%;
+    padding: 13px;
+    border-radius: var(--radius);
+    border: none;
+    font-family: var(--display);
+    font-size: 14px;
+    font-weight: 700;
+    cursor: pointer;
+    background: linear-gradient(135deg, #4fc3f7, #57c97d);
+    color: #0a0c10;
+    letter-spacing: 0.3px;
+    transition: all .2s;
+    position: relative;
+    overflow: hidden;
+  }
+  #run-btn:hover:not(:disabled) { opacity: .9; transform: translateY(-1px); }
+  #run-btn:disabled {
+    background: var(--border2); color: var(--muted); cursor: not-allowed;
+    transform: none;
+  }
+
+  /* ── Run History ──────────────────────────────────────────────────── */
+  .history-list { display: flex; flex-direction: column; gap: 7px; }
+  .history-item {
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 10px 12px;
+    background: var(--surface2);
+    cursor: pointer;
+    transition: border-color .15s;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .history-item:hover { border-color: var(--border2); }
+  .hist-dot {
+    width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+  }
+  .hist-dot.completed { background: var(--success); }
+  .hist-dot.running   { background: var(--hive); animation: pulse 1s infinite; }
+  .hist-dot.failed    { background: var(--error); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+  .hist-info { flex: 1; min-width: 0; }
+  .hist-name { font-size: 12px; font-weight: 600; }
+  .hist-meta { font-size: 10px; color: var(--muted); font-family: var(--mono); margin-top: 2px; }
+  .hist-time { font-family: var(--mono); font-size: 10px; color: var(--muted); white-space: nowrap; }
+
+  /* ── Right Panel ──────────────────────────────────────────────────── */
+  .right-panel {
+    display: flex; flex-direction: column;
+    background: var(--bg);
+    overflow: hidden;
+  }
+
+  .right-tabs {
+    display: flex; gap: 0;
+    border-bottom: 1px solid var(--border);
+    padding: 0 24px;
+    background: var(--surface);
+  }
+  .tab-btn {
+    background: none; border: none; color: var(--muted);
+    font-family: var(--display); font-size: 12px; font-weight: 600;
+    padding: 14px 18px;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: all .15s;
+    letter-spacing: 0.3px;
+  }
+  .tab-btn.active { color: var(--text); border-bottom-color: #4fc3f7; }
+  .tab-btn:hover  { color: var(--text); }
+
+  .tab-content { display: none; flex: 1; overflow: hidden; }
+  .tab-content.active { display: flex; flex-direction: column; }
+
+  /* ── Terminal / Log Viewer ────────────────────────────────────────── */
+  #terminal-wrap {
+    flex: 1; overflow: hidden; display: flex; flex-direction: column;
+  }
+  .terminal-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .terminal-title { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .terminal-controls { display: flex; gap: 6px; }
+  .t-btn {
+    background: var(--surface2); border: 1px solid var(--border2);
+    color: var(--muted); font-family: var(--mono); font-size: 10px;
+    padding: 3px 10px; border-radius: 4px; cursor: pointer;
+  }
+  .t-btn:hover { color: var(--text); }
+
+  #log-output {
+    flex: 1; overflow-y: auto; padding: 16px 20px;
+    font-family: var(--mono); font-size: 12px; line-height: 1.7;
+    background: var(--bg);
+    white-space: pre-wrap; word-break: break-all;
+  }
+  #log-output .line { color: var(--muted); }
+  #log-output .line.info    { color: #c8d0e0; }
+  #log-output .line.success { color: var(--success); }
+  #log-output .line.error   { color: var(--error); }
+  #log-output .line.done    { color: var(--success); font-weight: 600; }
+  #log-output .ts { color: #3d4555; margin-right: 10px; }
+
+  /* ── Progress Bar ─────────────────────────────────────────────────── */
+  .progress-wrap {
+    padding: 12px 20px;
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .progress-label {
+    display: flex; justify-content: space-between;
+    font-family: var(--mono); font-size: 10px; color: var(--muted);
+    margin-bottom: 6px;
+  }
+  .progress-bar {
+    height: 4px; background: var(--border);
+    border-radius: 2px; overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%; width: 0%;
+    background: linear-gradient(90deg, #4fc3f7, #57c97d);
+    border-radius: 2px;
+    transition: width .3s ease;
+  }
+
+  /* ── Results Tab ──────────────────────────────────────────────────── */
+  #results-tab {
+    overflow-y: auto; padding: 24px;
+    gap: 20px;
+  }
+  .result-section { margin-bottom: 24px; }
+  .result-section h3 {
+    font-size: 13px; font-weight: 700; color: var(--text);
+    margin-bottom: 12px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .result-section h3 span.badge {
+    font-family: var(--mono); font-size: 10px;
+    background: var(--surface2); border: 1px solid var(--border2);
+    padding: 2px 8px; border-radius: 12px; color: var(--muted);
+  }
+  .data-table {
+    width: 100%; border-collapse: collapse;
+    font-family: var(--mono); font-size: 11px;
+  }
+  .data-table th {
+    text-align: left; padding: 8px 12px;
+    background: var(--surface); border-bottom: 1px solid var(--border);
+    color: var(--muted); font-weight: 600;
+    position: sticky; top: 0;
+  }
+  .data-table td {
+    padding: 7px 12px; border-bottom: 1px solid var(--border);
+    color: var(--text);
+  }
+  .data-table tr:hover td { background: var(--surface2); }
+
+  /* ── Stats Chips ──────────────────────────────────────────────────── */
+  .stats-row {
+    display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 20px;
+  }
+  .stat-chip {
+    background: var(--surface2); border: 1px solid var(--border2);
+    border-radius: 8px; padding: 10px 16px;
+  }
+  .stat-chip .sv { font-size: 18px; font-weight: 700; font-family: var(--mono); }
+  .stat-chip .sk { font-size: 10px; color: var(--muted); margin-top: 2px; }
+
+  /* ── Empty State ──────────────────────────────────────────────────── */
+  .empty-state {
+    flex: 1; display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 12px; color: var(--muted);
+  }
+  .empty-icon { font-size: 48px; opacity: .4; }
+  .empty-text { font-size: 14px; }
+  .empty-sub  { font-size: 12px; font-family: var(--mono); opacity: .6; }
+
+  /* ── Scrollbar ────────────────────────────────────────────────────── */
+  ::-webkit-scrollbar { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<!-- ── Header ───────────────────────────────────────────────────────── -->
+<header>
+  <div class="logo">
+    <div class="logo-icon">🛰</div>
+    <div>
+      <div class="logo-text">ETL Pipeline Runner</div>
+      <div class="logo-sub">NASA HTTP Log Analytics · DAS 839</div>
+    </div>
+  </div>
+  <div id="db-badge">⬤ checking postgres…</div>
+</header>
+
+<!-- ── Main ─────────────────────────────────────────────────────────── -->
+<main>
+
+  <!-- Left Panel -->
+  <div class="left-panel">
+
+    <!-- Pipeline Selector -->
+    <div>
+      <div class="section-label">Select Pipeline</div>
+      <div class="pipeline-grid">
+        <div class="pipeline-card pig" data-pipeline="pig" onclick="selectPipeline(this)">
+          <span class="card-emoji">🐷</span>
+          <div class="card-name">Apache Pig</div>
+          <div class="card-desc">Pig Latin scripts</div>
+          <div class="card-check">✓</div>
+        </div>
+        <div class="pipeline-card mapreduce" data-pipeline="mapreduce" onclick="selectPipeline(this)">
+          <span class="card-emoji">🗺️</span>
+          <div class="card-name">MapReduce</div>
+          <div class="card-desc">Hadoop Streaming</div>
+          <div class="card-check">✓</div>
+        </div>
+        <div class="pipeline-card mongodb" data-pipeline="mongodb" onclick="selectPipeline(this)">
+          <span class="card-emoji">🍃</span>
+          <div class="card-name">MongoDB</div>
+          <div class="card-desc">Aggregation pipeline</div>
+          <div class="card-check">✓</div>
+        </div>
+        <div class="pipeline-card hive" data-pipeline="hive" onclick="selectPipeline(this)">
+          <span class="card-emoji">🐝</span>
+          <div class="card-name">Hive</div>
+          <div class="card-desc">HiveQL queries</div>
+          <div class="card-check">✓</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Configuration -->
+    <div>
+      <div class="section-label">Configuration</div>
+      <div style="display:flex; flex-direction:column; gap:12px;">
+        <div class="form-group">
+          <label class="form-label">Log file paths (one per line)</label>
+          <textarea id="log-files" class="form-input" placeholder="/data/NASA_access_log_Jul95&#10;/data/NASA_access_log_Aug95"></textarea>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Batch size (records per batch)</label>
+          <input id="batch-size" type="number" class="form-input" value="10000" min="100" max="1000000"/>
+        </div>
+      </div>
+    </div>
+
+    <!-- Run Button -->
+    <button id="run-btn" onclick="triggerRun()" disabled>
+      Select a pipeline to run
+    </button>
+
+    <!-- History -->
+    <div>
+      <div class="section-label">Run History</div>
+      <div id="history-list" class="history-list">
+        <div style="font-size:11px; color:var(--muted); font-family:var(--mono);">No runs yet.</div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Right Panel -->
+  <div class="right-panel">
+    <div class="right-tabs">
+      <button class="tab-btn active" onclick="switchTab('terminal', this)">Terminal</button>
+      <button class="tab-btn" onclick="switchTab('results', this)">Results</button>
+      <button class="tab-btn" onclick="switchTab('schema', this)">DB Schema</button>
+    </div>
+
+    <!-- Terminal Tab -->
+    <div id="terminal-tab" class="tab-content active">
+      <div id="terminal-wrap">
+        <div class="terminal-header">
+          <span class="terminal-title" id="terminal-title">No run active</span>
+          <div class="terminal-controls">
+            <button class="t-btn" onclick="clearLog()">Clear</button>
+            <button class="t-btn" onclick="scrollToBottom()">↓ Bottom</button>
+          </div>
+        </div>
+        <div id="log-output">
+          <div class="line" style="color:var(--muted)">
+   ██████████████████████████████████
+   ██  ETL Pipeline Runner  v1.0   ██
+   ██  NASA HTTP Log Analytics     ██
+   ██████████████████████████████████
+
+   ← Select a pipeline and log files, then click Run.
+   Results will be stored in PostgreSQL for visualization.
+          </div>
+        </div>
+        <div class="progress-wrap">
+          <div class="progress-label">
+            <span id="progress-label-left">Idle</span>
+            <span id="progress-label-right"></span>
+          </div>
+          <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Results Tab -->
+    <div id="results-tab" class="tab-content">
+      <div id="results-content" class="empty-state">
+        <div class="empty-icon">📊</div>
+        <div class="empty-text">No results yet</div>
+        <div class="empty-sub">Run a pipeline to see aggregated query results here</div>
+      </div>
+    </div>
+
+    <!-- Schema Tab -->
+    <div id="schema-tab" class="tab-content">
+      <div style="overflow-y:auto; padding:24px; font-family:var(--mono); font-size:12px; line-height:1.8; color:#8899bb; flex:1;">
+<pre style="color:#c8d0e0;">
+<span style="color:#4fc3f7;">TABLE</span> etl_runs
+  run_id           SERIAL PK
+  pipeline         VARCHAR(20)    -- pig | mapreduce | mongodb | hive
+  run_uuid         VARCHAR(64)    UNIQUE
+  batch_size       INTEGER
+  total_records    INTEGER
+  total_batches    INTEGER
+  avg_batch_size   NUMERIC(10,2)
+  malformed_count  INTEGER
+  runtime_seconds  NUMERIC(10,3)
+  status           VARCHAR(20)    -- running | completed | failed
+  started_at       TIMESTAMPTZ
+  completed_at     TIMESTAMPTZ
+
+<span style="color:#4fc3f7;">TABLE</span> daily_traffic
+  id               SERIAL PK
+  run_id           INTEGER FK → etl_runs
+  pipeline         VARCHAR(20)
+  run_uuid         VARCHAR(64)
+  batch_id         INTEGER
+  executed_at      TIMESTAMPTZ
+  log_date         DATE
+  status_code      INTEGER
+  request_count    BIGINT
+  total_bytes      BIGINT
+
+<span style="color:#4fc3f7;">TABLE</span> q2_top_resources
+  id                    SERIAL PK
+  run_id                INTEGER FK → etl_runs
+  pipeline              VARCHAR(20)
+  run_uuid              VARCHAR(64)
+  batch_id              INTEGER
+  executed_at           TIMESTAMPTZ
+  resource_path         TEXT
+  request_count         BIGINT
+  total_bytes           BIGINT
+  distinct_host_count   BIGINT
+
+<span style="color:#4fc3f7;">TABLE</span> q3_hourly_errors
+  id                    SERIAL PK
+  run_id                INTEGER FK → etl_runs
+  pipeline              VARCHAR(20)
+  run_uuid              VARCHAR(64)
+  batch_id              INTEGER
+  executed_at           TIMESTAMPTZ
+  log_date              DATE
+  log_hour              SMALLINT
+  error_request_count   BIGINT
+  total_request_count   BIGINT
+  error_rate            NUMERIC(6,4)
+  distinct_error_hosts  BIGINT
+
+<span style="color:#57c97d;">-- Indexes for query performance --</span>
+idx_q1_pipeline_date    ON q1_daily_traffic(pipeline, log_date)
+idx_q2_pipeline         ON q2_top_resources(pipeline, request_count DESC)
+idx_q3_pipeline_date    ON q3_hourly_errors(pipeline, log_date, log_hour)
+idx_runs_uuid           ON etl_runs(run_uuid)
+</pre>
+      </div>
+    </div>
+
+  </div>
+</main>
+
+<script>
+const API = "http://localhost:5050";
+let selectedPipeline = null;
+let isRunning = false;
+let logCount = 0;
+
+// ── Pipeline Selection ─────────────────────────────────────────────────────
+function selectPipeline(card) {
+  if (isRunning) return;
+  document.querySelectorAll(".pipeline-card").forEach(c => c.classList.remove("selected"));
+  card.classList.add("selected");
+  selectedPipeline = card.dataset.pipeline;
+  const btn = document.getElementById("run-btn");
+  btn.disabled = false;
+  const labels = { 
+    pig: "🐷 Run Apache Pig", 
+    mapreduce: "🗺️ Run MapReduce",
+    mongodb: "🍃 Run MongoDB", 
+    hive: "🐝 Run Hive" 
+  };
+  btn.textContent = labels[selectedPipeline] || "Run Pipeline";
+}
+
+// ── Tab Switching ──────────────────────────────────────────────────────────
+function switchTab(name, btn) {
+  document.querySelectorAll(".tab-content").forEach(t => t.classList.remove("active"));
+  document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+  document.getElementById(name + "-tab").classList.add("active");
+  btn.classList.add("active");
+}
+
+// ── Log Helpers ────────────────────────────────────────────────────────────
+function appendLog(msg, cls = "info") {
+  const out = document.getElementById("log-output");
+  const ts  = new Date().toISOString().substr(11, 12);
+  const div = document.createElement("div");
+  div.className = "line " + cls;
+  div.innerHTML = `<span class="ts">${ts}</span>${escHtml(msg)}`;
+  out.appendChild(div);
+  logCount++;
+  if (logCount % 5 === 0) scrollToBottom();
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+function clearLog() {
+  document.getElementById("log-output").innerHTML = "";
+  logCount = 0;
+}
+
+function scrollToBottom() {
+  const out = document.getElementById("log-output");
+  out.scrollTop = out.scrollHeight;
+}
+
+// ── Progress ───────────────────────────────────────────────────────────────
+function setProgress(pct, label) {
+  document.getElementById("progress-fill").style.width = pct + "%";
+  document.getElementById("progress-label-left").textContent = label;
+}
+
+function animateProgress() {
+  let p = 0;
+  const iv = setInterval(() => {
+    p = Math.min(p + (Math.random() * 3), 90);
+    setProgress(p, "Running…");
+    if (!isRunning) { clearInterval(iv); }
+  }, 400);
+  return iv;
+}
+
+// ── Trigger Run ────────────────────────────────────────────────────────────
+async function triggerRun() {
+  if (isRunning || !selectedPipeline) return;
+
+  const filesRaw  = document.getElementById("log-files").value.trim();
+  const batchSize = parseInt(document.getElementById("batch-size").value) || 10000;
+  const logFiles  = filesRaw.split("\n").map(s => s.trim()).filter(Boolean);
+
+  if (!logFiles.length) {
+    appendLog("❌ Please enter at least one log file path.", "error");
+    switchTab("terminal", document.querySelector(".tab-btn"));
+    return;
+  }
+
+  isRunning = true;
+  const btn = document.getElementById("run-btn");
+  btn.disabled = true;
+  btn.textContent = "⏳ Running…";
+  document.getElementById("terminal-title").textContent =
+    `[${selectedPipeline.toUpperCase()}]  batch_size=${batchSize.toLocaleString()}`;
+
+  switchTab("terminal", document.querySelector(".tab-btn"));
+  clearLog();
+  appendLog(`▶ Starting ${selectedPipeline.toUpperCase()} pipeline…`, "info");
+  appendLog(`  Files: ${logFiles.join(", ")}`, "info");
+  appendLog(`  Batch size: ${batchSize.toLocaleString()}`, "info");
+  appendLog("─".repeat(60), "info");
+
+  const iv = animateProgress();
+
+  try {
+    const resp = await fetch(`${API}/api/run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ 
+        pipeline: selectedPipeline, 
+        batch_size: batchSize, 
+        log_files: logFiles 
+      })
+    });
+
+    if (!resp.ok) {
+      let errMsg = resp.statusText;
+      try {
+        const errData = await resp.json();
+        errMsg = errData.error || errMsg;
+      } catch {}
+      throw new Error(errMsg);
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let lastRunUuid = null;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      
+      buf += decoder.decode(value, { stream: true });
+      const events = buf.split("\n\n");
+      buf = events.pop() || "";
+      
+      for (const event of events) {
+        if (!event.trim()) continue;
+        const dataLine = event.split("\n").find(l => l.startsWith("data:"));
+        if (!dataLine) continue;
+        
+        try {
+          const obj = JSON.parse(dataLine.slice(5));
+          
+          if (obj.type === "log") {
+            appendLog(obj.message, "info");
+          } else if (obj.type === "done") {
+            clearInterval(iv);
+            lastRunUuid = obj.message;
+            setProgress(100, "Completed");
+            appendLog("─".repeat(60), "info");
+            appendLog(`✅ Pipeline completed! run_uuid = ${obj.message}`, "done");
+            appendLog("Results are now in PostgreSQL → check Results tab to visualize.", "success");
+          } else if (obj.type === "error") {
+            clearInterval(iv);
+            setProgress(0, "Failed");
+            appendLog("─".repeat(60), "info");
+            appendLog("❌ Pipeline error:\n" + obj.message, "error");
+          }
+        } catch (e) {
+          console.error("Failed to parse event:", e, dataLine);
+        }
+      }
+    }
+
+    // Load results if available
+    if (lastRunUuid) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      await loadResults(lastRunUuid);
+      await loadHistory();
+    }
+
+  } catch (e) {
+    clearInterval(iv);
+    setProgress(0, "Error");
+    appendLog("❌ Request failed: " + e.message, "error");
+  }
+
+  isRunning = false;
+  btn.disabled = false;
+  btn.textContent = { 
+    pig: "🐷 Run Apache Pig", 
+    mapreduce: "🗺️ Run MapReduce",
+    mongodb: "🍃 Run MongoDB", 
+    hive: "🐝 Run Hive" 
+  }[selectedPipeline];
+}
+
+// ── Load & Render Results ──────────────────────────────────────────────────
+async function loadResults(runUuid) {
+  try {
+    const r = await fetch(`${API}/api/run/${runUuid}`);
+    const data = await r.json();
+    if (data.error) {
+      appendLog("Could not fetch results: " + data.error, "error");
+      return;
+    }
+    renderResults(data);
+    switchTab("results", document.querySelectorAll(".tab-btn")[1]);
+  } catch(e) {
+    appendLog("Could not fetch results: " + e.message, "error");
+  }
+}
+
+function renderResults(data) {
+  const run = data.run;
+  const container = document.getElementById("results-content");
+  container.className = "";
+  container.style = "overflow-y:auto; padding:24px; flex:1;";
+
+  const pipeColors = { pig:"#ff6b35", mapreduce:"#4fc3f7", mongodb:"#57c97d", hive:"#ffd54f" };
+  const color = pipeColors[run.pipeline] || "#4fc3f7";
+
+  container.innerHTML = `
+    <div class="stats-row">
+      <div class="stat-chip"><div class="sv" style="color:${color}">${(run.pipeline || "").toUpperCase()}</div><div class="sk">Pipeline</div></div>
+      <div class="stat-chip"><div class="sv">${(run.total_records||0).toLocaleString()}</div><div class="sk">Records</div></div>
+      <div class="stat-chip"><div class="sv">${run.total_batches||0}</div><div class="sk">Batches</div></div>
+      <div class="stat-chip"><div class="sv">${run.runtime_seconds ? run.runtime_seconds.toFixed(2)+'s' : '—'}</div><div class="sk">Runtime</div></div>
+      <div class="stat-chip"><div class="sv">${run.malformed_count||0}</div><div class="sk">Malformed</div></div>
+      <div class="stat-chip"><div class="sv">${run.avg_batch_size ? parseFloat(run.avg_batch_size).toFixed(0) : '—'}</div><div class="sk">Avg Batch</div></div>
+    </div>
+
+    <div class="result-section">
+      <h3>📅 Q1 · Daily Traffic Summary <span class="badge">${(data.q1||[]).length} rows</span></h3>
+      ${tableHtml(data.q1||[], ["log_date","status_code","request_count","total_bytes"])}
+    </div>
+
+    <div class="result-section">
+      <h3>🔗 Q2 · Top Requested Resources <span class="badge">${(data.q2||[]).length} rows</span></h3>
+      ${tableHtml(data.q2||[], ["resource_path","request_count","total_bytes","distinct_host_count"])}
+    </div>
+
+    <div class="result-section">
+      <h3>⚠️ Q3 · Hourly Error Analysis <span class="badge">${(data.q3||[]).length} rows</span></h3>
+      ${tableHtml(data.q3||[], ["log_date","log_hour","error_request_count","total_request_count","error_rate","distinct_error_hosts"])}
+    </div>
+  `;
+}
+
+function tableHtml(rows, cols) {
+  if (!rows.length) return `<div style="font-family:var(--mono);font-size:11px;color:var(--muted);padding:8px 0;">No rows.</div>`;
+  const headers = cols.map(c => `<th>${c}</th>`).join("");
+  const bodyRows = rows.slice(0,50).map(r =>
+    `<tr>${cols.map(c => `<td>${formatCell(r[c])}</td>`).join("")}</tr>`
+  ).join("");
+  return `<div style="overflow-x:auto"><table class="data-table"><thead><tr>${headers}</tr></thead><tbody>${bodyRows}</tbody></table></div>`;
+}
+
+function formatCell(val) {
+  if (val === null || val === undefined) return "—";
+  if (typeof val === "number" && !Number.isInteger(val)) {
+    return val.toFixed(4);
+  }
+  if (typeof val === "number") {
+    return val.toLocaleString();
+  }
+  return val;
+}
+
+// ── History ────────────────────────────────────────────────────────────────
+async function loadHistory() {
+  try {
+    const r = await fetch(`${API}/api/runs`);
+    const runs = await r.json();
+    const list = document.getElementById("history-list");
+    
+    if (!runs || !runs.length) return;
+    
+    const pipeEmoji = { pig:"🐷", mapreduce:"🗺️", mongodb:"🍃", hive:"🐝" };
+    list.innerHTML = runs.slice(0, 8).map(r => `
+      <div class="history-item" onclick="loadResults('${r.run_uuid}')">
+        <div class="hist-dot ${r.status}"></div>
+        <div class="hist-info">
+          <div class="hist-name">${pipeEmoji[r.pipeline]||''} ${(r.pipeline||'').toUpperCase()}</div>
+          <div class="hist-meta">${(r.total_records||0).toLocaleString()} rec · ${r.total_batches||0} batches · ${r.runtime_seconds ? r.runtime_seconds.toFixed(1)+'s' : '…'}</div>
+        </div>
+        <div class="hist-time">${r.started_at ? new Date(r.started_at).toLocaleTimeString() : ''}</div>
+      </div>`).join("");
+  } catch(e) { 
+    console.error("Error loading history:", e);
+  }
+}
+
+// ── DB Status Check ────────────────────────────────────────────────────────
+async function checkStatus() {
+  const badge = document.getElementById("db-badge");
+  try {
+    const r = await fetch(`${API}/api/status`);
+    const data = await r.json();
+    if (data.db === "ok") {
+      badge.textContent = "⬤ Postgres connected";
+      badge.className = "ok";
+      loadHistory();
+    } else {
+      badge.textContent = "⬤ Postgres error";
+      badge.className = "error";
+    }
+  } catch(e) {
+    badge.textContent = "⬤ Server offline";
+    badge.className = "error";
+  }
+}
+
+// ── Init ───────────────────────────────────────────────────────────────────
+checkStatus();
+setInterval(checkStatus, 10000);
+</script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: etl_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       etl_logs
+      POSTGRES_USER:     etl_user
+      POSTGRES_PASSWORD: etl_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+
+volumes:
+  pgdata:

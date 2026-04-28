@@ -1,10 +1,10 @@
 // mongodb_pipeline.js
-// Phase 1 MongoDB ETL Pipeline (Fixed Version)
-// Run:
+// MongoDB ETL Pipeline for NASA HTTP Log Analysis
+// Usage:
 // npm init -y
 // npm install mongodb pg
 // package.json -> "type": "module"
-// node mongodb_pipeline.js <log_file_path> <batch_size>
+// node mongodb_pipeline.js <log_file_path> <batch_size> <run_id> <run_uuid>
 
 import fs from "fs";
 import readline from "readline";
@@ -94,24 +94,32 @@ function parseLogLine(line) {
 // ----------------------
 async function initializePostgres(pgClient) {
   await pgClient.query(`
-    CREATE TABLE IF NOT EXISTS pipeline_runs (
+    CREATE TABLE IF NOT EXISTS etl_runs (
       run_id SERIAL PRIMARY KEY,
-      pipeline_name VARCHAR(50),
-      batch_size INT,
-      total_batches INT,
-      avg_batch_size FLOAT,
-      malformed_records INT,
-      runtime_seconds FLOAT,
-      execution_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      pipeline VARCHAR(20),
+      run_uuid VARCHAR(64) UNIQUE,
+      batch_size INTEGER,
+      total_records INTEGER,
+      total_batches INTEGER,
+      avg_batch_size NUMERIC(10,2),
+      malformed_count INTEGER,
+      runtime_seconds NUMERIC(10,3),
+      status VARCHAR(20),
+      started_at TIMESTAMPTZ,
+      completed_at TIMESTAMPTZ
     );
   `);
 
   await pgClient.query(`
-    CREATE TABLE IF NOT EXISTS daily_traffic_summary (
-      run_id INT,
-      batch_id INT,
+    CREATE TABLE IF NOT EXISTS daily_traffic (
+      id SERIAL PRIMARY KEY,
+      run_id INTEGER,
+      pipeline VARCHAR(20),
+      run_uuid VARCHAR(64),
+      batch_id INTEGER,
+      executed_at TIMESTAMPTZ DEFAULT NOW(),
       log_date DATE,
-      status_code INT,
+      status_code INTEGER,
       request_count BIGINT,
       total_bytes BIGINT
     );
@@ -119,8 +127,12 @@ async function initializePostgres(pgClient) {
 
   await pgClient.query(`
     CREATE TABLE IF NOT EXISTS top_resources (
-      run_id INT,
-      batch_id INT,
+      id SERIAL PRIMARY KEY,
+      run_id INTEGER,
+      pipeline VARCHAR(20),
+      run_uuid VARCHAR(64),
+      batch_id INTEGER,
+      executed_at TIMESTAMPTZ DEFAULT NOW(),
       resource_path TEXT,
       request_count BIGINT,
       total_bytes BIGINT,
@@ -129,14 +141,18 @@ async function initializePostgres(pgClient) {
   `);
 
   await pgClient.query(`
-    CREATE TABLE IF NOT EXISTS hourly_error_analysis (
-      run_id INT,
-      batch_id INT,
+    CREATE TABLE IF NOT EXISTS hourly_errors (
+      id SERIAL PRIMARY KEY,
+      run_id INTEGER,
+      pipeline VARCHAR(20),
+      run_uuid VARCHAR(64),
+      batch_id INTEGER,
+      executed_at TIMESTAMPTZ DEFAULT NOW(),
       log_date DATE,
-      log_hour INT,
+      log_hour SMALLINT,
       error_request_count BIGINT,
       total_request_count BIGINT,
-      error_rate FLOAT,
+      error_rate NUMERIC(6,4),
       distinct_error_hosts BIGINT
     );
   `);
@@ -149,10 +165,12 @@ async function processBatch(
   batch,
   batchId,
   runId,
+  runUuid,
+  pipeline,
   logsCollection,
   pgClient
 ) {
-  console.log(`Processing Batch ${batchId} (${batch.length} rows)`);
+  console.log(`[Batch ${batchId}] Processing ${batch.length} records...`);
 
   // Clear previous batch
   await logsCollection.deleteMany({});
@@ -163,6 +181,7 @@ async function processBatch(
   // ----------------------
   // Query 1: Daily Traffic Summary
   // ----------------------
+  console.log(`[Batch ${batchId}] Running Q1 (Daily Traffic)...`);
   const dailySummary = await logsCollection
     .aggregate([
       {
@@ -181,12 +200,14 @@ async function processBatch(
   for (const row of dailySummary) {
     await pgClient.query(
       `
-      INSERT INTO daily_traffic_summary
-      (run_id, batch_id, log_date, status_code, request_count, total_bytes)
-      VALUES ($1,$2,$3,$4,$5,$6)
+      INSERT INTO daily_traffic
+      (run_id, pipeline, run_uuid, batch_id, log_date, status_code, request_count, total_bytes)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       `,
       [
         runId,
+        pipeline,
+        runUuid,
         batchId,
         row._id.log_date,
         row._id.status_code,
@@ -199,6 +220,7 @@ async function processBatch(
   // ----------------------
   // Query 2: Top Requested Resources
   // ----------------------
+  console.log(`[Batch ${batchId}] Running Q2 (Top Resources)...`);
   const topResources = await logsCollection
     .aggregate([
       {
@@ -226,12 +248,13 @@ async function processBatch(
     await pgClient.query(
       `
       INSERT INTO top_resources
-      (run_id, batch_id, resource_path, request_count,
-       total_bytes, distinct_host_count)
-      VALUES ($1,$2,$3,$4,$5,$6)
+      (run_id, pipeline, run_uuid, batch_id, resource_path, request_count, total_bytes, distinct_host_count)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       `,
       [
         runId,
+        pipeline,
+        runUuid,
         batchId,
         row.resource_path,
         row.request_count,
@@ -244,6 +267,7 @@ async function processBatch(
   // ----------------------
   // Query 3: Hourly Error Analysis
   // ----------------------
+  console.log(`[Batch ${batchId}] Running Q3 (Hourly Errors)...`);
   const hourlyErrors = await logsCollection
     .aggregate([
       {
@@ -309,14 +333,14 @@ async function processBatch(
   for (const row of hourlyErrors) {
     await pgClient.query(
       `
-      INSERT INTO hourly_error_analysis
-      (run_id, batch_id, log_date, log_hour,
-       error_request_count, total_request_count,
-       error_rate, distinct_error_hosts)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      INSERT INTO hourly_errors
+      (run_id, pipeline, run_uuid, batch_id, log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
       `,
       [
         runId,
+        pipeline,
+        runUuid,
         batchId,
         row.log_date,
         row.log_hour,
@@ -327,13 +351,23 @@ async function processBatch(
       ]
     );
   }
+
+  console.log(`[Batch ${batchId}] ✓ Completed`);
 }
 
 // ----------------------
 // Main Pipeline
 // ----------------------
-async function runPipeline(logFilePath, batchSize) {
+async function runPipeline(logFilePath, batchSize, runId, runUuid, pipeline) {
   const startTime = Date.now();
+
+  console.log(`
+╔════════════════════════════════════════════════════════════╗
+║              MongoDB ETL Pipeline Started                  ║
+║  Run UUID: ${runUuid}
+║  Batch Size: ${batchSize}
+╚════════════════════════════════════════════════════════════╝
+  `);
 
   // MongoDB
   const mongoClient = new MongoClient(MONGO_URI);
@@ -353,24 +387,12 @@ async function runPipeline(logFilePath, batchSize) {
   let validRecords = 0;
   let totalBatches = 0;
 
-  // Create pipeline run first
-  const runInsert = await pgClient.query(
-    `
-    INSERT INTO pipeline_runs
-    (pipeline_name, batch_size, total_batches,
-     avg_batch_size, malformed_records, runtime_seconds)
-    VALUES ($1,$2,0,0,0,0)
-    RETURNING run_id
-    `,
-    ["MongoDB", batchSize]
-  );
-
-  const runId = runInsert.rows[0].run_id;
-
   const rl = readline.createInterface({
     input: fs.createReadStream(logFilePath),
     crlfDelay: Infinity,
   });
+
+  console.log(`Reading from: ${logFilePath}`);
 
   for await (const line of rl) {
     totalRecords++;
@@ -390,6 +412,8 @@ async function runPipeline(logFilePath, batchSize) {
         batch,
         batchId,
         runId,
+        runUuid,
+        pipeline,
         logsCollection,
         pgClient
       );
@@ -406,6 +430,8 @@ async function runPipeline(logFilePath, batchSize) {
       batch,
       batchId,
       runId,
+      runUuid,
+      pipeline,
       logsCollection,
       pgClient
     );
@@ -420,30 +446,39 @@ async function runPipeline(logFilePath, batchSize) {
   // Update final metadata
   await pgClient.query(
     `
-    UPDATE pipeline_runs
-    SET total_batches = $1,
-        avg_batch_size = $2,
-        malformed_records = $3,
-        runtime_seconds = $4
-    WHERE run_id = $5
+    UPDATE etl_runs
+    SET total_records = $1,
+        total_batches = $2,
+        avg_batch_size = $3,
+        malformed_count = $4,
+        runtime_seconds = $5,
+        status = $6,
+        completed_at = NOW()
+    WHERE run_id = $7
     `,
     [
+      totalRecords,
       totalBatches,
       avgBatchSize,
       malformedRecords,
       runtimeSeconds,
+      "completed",
       runId,
     ]
   );
 
-  console.log("\n===== PIPELINE COMPLETE =====");
-  console.log(`Run ID: ${runId}`);
-  console.log(`Total Records: ${totalRecords}`);
-  console.log(`Valid Records: ${validRecords}`);
-  console.log(`Malformed Records: ${malformedRecords}`);
-  console.log(`Total Batches: ${totalBatches}`);
-  console.log(`Average Batch Size: ${avgBatchSize.toFixed(2)}`);
-  console.log(`Runtime: ${runtimeSeconds.toFixed(2)} sec`);
+  console.log(`
+╔════════════════════════════════════════════════════════════╗
+║                  PIPELINE COMPLETED ✓                      ║
+╠════════════════════════════════════════════════════════════╣
+║  Total Records:      ${String(totalRecords).padEnd(40, ' ')}║
+║  Valid Records:      ${String(validRecords).padEnd(40, ' ')}║
+║  Malformed:          ${String(malformedRecords).padEnd(40, ' ')}║
+║  Total Batches:      ${String(totalBatches).padEnd(40, ' ')}║
+║  Avg Batch Size:     ${String(avgBatchSize.toFixed(2)).padEnd(40, ' ')}║
+║  Runtime:            ${String(runtimeSeconds.toFixed(2) + ' sec').padEnd(40, ' ')}║
+╚════════════════════════════════════════════════════════════╝
+  `);
 
   await mongoClient.close();
   await pgClient.end();
@@ -454,15 +489,20 @@ async function runPipeline(logFilePath, batchSize) {
 // ----------------------
 const args = process.argv.slice(2);
 
-if (args.length < 2) {
-  console.log(
-    "Usage: node mongodb_pipeline.js <log_file_path> <batch_size>"
+if (args.length < 4) {
+  console.error(
+    "Usage: node mongodb_pipeline.js <log_file_path> <batch_size> <run_id> <run_uuid>"
   );
   process.exit(1);
 }
 
-const [logFilePath, batchSize] = args;
+const [logFilePath, batchSize, runIdArg, runUuid] = args;
+const runId = parseInt(runIdArg);
+const pipeline = "mongodb";
 
-runPipeline(logFilePath, parseInt(batchSize)).catch((err) => {
-  console.error("Pipeline failed:", err);
-});
+runPipeline(logFilePath, parseInt(batchSize), runId, runUuid, pipeline).catch(
+  (err) => {
+    console.error("Pipeline failed:", err);
+    process.exit(1);
+  }
+);
