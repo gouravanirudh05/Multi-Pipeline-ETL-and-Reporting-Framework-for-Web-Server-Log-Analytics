@@ -18,8 +18,14 @@ The pipeline reads raw log text directly. Manual preprocessing outside pipeline 
 
 ## Implemented Pipelines
 
-- `mongo/` – MongoDB-based ETL + reporting load.
+- `pipelines/mongo/` – MongoDB-based ETL + reporting load.
 - `pig/` – Apache Pig-based ETL + reporting load.
+- `pipelines/mapreduce/` – Java Hadoop MapReduce ETL + reporting load.
+- `pipelines/hive/` – HiveQL ETL + reporting load.
+
+The interface supports record-count batching and time-window batching. Record mode follows
+the project statement's "records per batch" definition. Time mode groups parsed log records
+into sequential non-empty timestamp windows.
 
 ## Mandatory Queries Covered
 
@@ -27,19 +33,21 @@ The pipeline reads raw log text directly. Manual preprocessing outside pipeline 
 2. Top requested resources (top 20 by `request_count` with bytes + distinct hosts)
 3. Hourly error analysis (`400–599` status range with error rate + distinct error hosts)
 
-## Pig Approach (newly added)
+## CLI Runs
 
-See `pig/README.md` for setup and run commands.
-
-Quick run:
+Run these from the repository root after PostgreSQL is available.
 
 ```bash
-cd pig
-chmod +x run_pig_pipeline.sh report_from_postgres.sh
-PG_CONN="postgresql://<user>:<pass>@<host>:<port>/<db>" ./run_pig_pipeline.sh /path/to/NASA_access_log_Jul95 50000
-PG_CONN="postgresql://<user>:<pass>@<host>:<port>/<db>" ./report_from_postgres.sh <run_id>
+python3 pig/orchestrator.py '["/path/to/NASA_access_log_Jul95"]' records 10000 pig-demo-records
+python3 pig/orchestrator.py '["/path/to/NASA_access_log_Jul95"]' time 3600 pig-demo-time
+
+./pipelines/mapreduce/run.sh '["/path/to/NASA_access_log_Jul95"]' records 10000 mr-demo-records
+./pipelines/mapreduce/run.sh '["/path/to/NASA_access_log_Jul95"]' time 3600 mr-demo-time
+
+python3 pipelines/hive/hive_pipeline.py '["/path/to/NASA_access_log_Jul95"]' records 10000 hive-demo-records
+python3 pipelines/hive/hive_pipeline.py '["/path/to/NASA_access_log_Jul95"]' time 3600 hive-demo-time
 ```
 
 ## Mongo Approach
 
-Mongo implementation is in `mongo/mongodb_pipeline.js`.
+Mongo implementation is in `pipelines/mongo/mongodb_pipeline.js`.

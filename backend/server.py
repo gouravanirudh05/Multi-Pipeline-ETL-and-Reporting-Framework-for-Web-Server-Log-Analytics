@@ -6,6 +6,7 @@ import json
 import psycopg2
 import psycopg2.extras
 import os
+import sys
 import uuid as uuid_lib
 from datetime import datetime
 
@@ -33,6 +34,31 @@ DB_CONFIG = {
 def get_conn():
     return psycopg2.connect(**DB_CONFIG)
 
+def _build_pipeline_env():
+    """Build env dict ensuring JAVA_HOME, HADOOP_HOME, PIG_HOME, HIVE_HOME are set."""
+    env = os.environ.copy()
+    home = os.path.expanduser("~")
+    defaults = {
+        "JAVA_HOME": ["/usr/lib/jvm/java-8-openjdk-amd64", "/usr/lib/jvm/java-11-openjdk-amd64"],
+        "HADOOP_HOME": [os.path.join(home, "hadoop")],
+        "PIG_HOME": [os.path.join(home, "pig")],
+        "HIVE_HOME": [os.path.join(home, "hive")],
+    }
+    for var, candidates in defaults.items():
+        if var not in env:
+            for path in candidates:
+                if os.path.isdir(path):
+                    env[var] = path
+                    break
+    # Ensure tool bin dirs are on PATH
+    extra_paths = []
+    for var in ["HADOOP_HOME", "PIG_HOME", "HIVE_HOME", "JAVA_HOME"]:
+        if var in env:
+            extra_paths.append(os.path.join(env[var], "bin"))
+    if extra_paths:
+        env["PATH"] = ":".join(extra_paths) + ":" + env.get("PATH", "/usr/bin:/bin")
+    return env
+
 def initialize_postgres():
     conn = get_conn()
     cur = conn.cursor()
@@ -49,6 +75,55 @@ def initialize_postgres():
             status VARCHAR(20),
             started_at TIMESTAMPTZ,
             completed_at TIMESTAMPTZ
+        )
+    """)
+    cur.execute("""
+        ALTER TABLE etl_runs
+        ADD COLUMN IF NOT EXISTS batch_mode VARCHAR(20) DEFAULT 'records'
+    """)
+    cur.execute("""
+        ALTER TABLE etl_runs
+        ADD COLUMN IF NOT EXISTS batch_interval_seconds INTEGER
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS daily_traffic (
+            id SERIAL PRIMARY KEY,
+            pipeline VARCHAR(20),
+            run_uuid VARCHAR(64),
+            batch_id INTEGER,
+            executed_at TIMESTAMPTZ DEFAULT NOW(),
+            log_date DATE,
+            status_code INTEGER,
+            request_count BIGINT,
+            total_bytes BIGINT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS top_resources (
+            id SERIAL PRIMARY KEY,
+            pipeline VARCHAR(20),
+            run_uuid VARCHAR(64),
+            batch_id INTEGER,
+            executed_at TIMESTAMPTZ DEFAULT NOW(),
+            resource_path TEXT,
+            request_count BIGINT,
+            total_bytes BIGINT,
+            distinct_host_count BIGINT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS hourly_errors (
+            id SERIAL PRIMARY KEY,
+            pipeline VARCHAR(20),
+            run_uuid VARCHAR(64),
+            batch_id INTEGER,
+            executed_at TIMESTAMPTZ DEFAULT NOW(),
+            log_date DATE,
+            log_hour SMALLINT,
+            error_request_count BIGINT,
+            total_request_count BIGINT,
+            error_rate NUMERIC(6,4),
+            distinct_error_hosts BIGINT
         )
     """)
     conn.commit()
@@ -73,11 +148,21 @@ def status():
 async def run_pipeline(req: Request):
     body = await req.json()
     pipeline = body.get("pipeline")
-    batch_size = body.get("batch_size", 10000)
+    batch_mode = body.get("batch_mode", "records")
+    batch_size = int(body.get("batch_size", 10000) or 10000)
+    batch_interval_seconds = int(body.get("batch_interval_seconds", 3600) or 3600)
     log_files = body.get("log_files", [])
 
     if not pipeline or not log_files:
         return {"error": "Missing pipeline or log_files"}
+    if batch_mode not in {"records", "time"}:
+        return {"error": "batch_mode must be 'records' or 'time'"}
+    if batch_size <= 0:
+        return {"error": "batch_size must be greater than 0"}
+    if batch_interval_seconds <= 0:
+        return {"error": "batch_interval_seconds must be greater than 0"}
+
+    batch_value = batch_interval_seconds if batch_mode == "time" else batch_size
 
     # Generate UUID for this run
     run_uuid = str(uuid_lib.uuid4())
@@ -94,9 +179,16 @@ async def run_pipeline(req: Request):
     try:
         cur.execute("""
             INSERT INTO etl_runs 
-            (pipeline, run_uuid, batch_size, status, started_at)
-            VALUES (%s, %s, %s, %s, NOW())
-        """, (pipeline, run_uuid, batch_size, "running"))
+            (pipeline, run_uuid, batch_size, batch_mode, batch_interval_seconds, status, started_at)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW())
+        """, (
+            pipeline,
+            run_uuid,
+            batch_size,
+            batch_mode,
+            batch_interval_seconds if batch_mode == "time" else None,
+            "running"
+        ))
 
         conn.commit()
     except Exception as e:
@@ -114,15 +206,37 @@ async def run_pipeline(req: Request):
             "node",
             os.path.join(PROJECT_ROOT, "pipelines", "mongo","mongodb_pipeline.js"),
             json.dumps(log_file_paths),
-            str(batch_size),
+            batch_mode,
+            str(batch_value),
             run_uuid
         ]
     elif pipeline == "pig":
-        cmd = ["echo", "Pig pipeline not yet implemented"]
+        cmd = [
+            sys.executable,
+            os.path.join(PROJECT_ROOT, "pig", "orchestrator.py"),
+            json.dumps(log_file_paths),
+            batch_mode,
+            str(batch_value),
+            run_uuid
+        ]
     elif pipeline == "mapreduce":
-        cmd = ["echo", "MapReduce pipeline not yet implemented"]
+        cmd = [
+            "bash",
+            os.path.join(PROJECT_ROOT, "pipelines", "mapreduce", "run.sh"),
+            json.dumps(log_file_paths),
+            batch_mode,
+            str(batch_value),
+            run_uuid
+        ]
     elif pipeline == "hive":
-        cmd = ["echo", "Hive pipeline not yet implemented"]
+        cmd = [
+            sys.executable,
+            os.path.join(PROJECT_ROOT, "pipelines", "hive", "hive_pipeline.py"),
+            json.dumps(log_file_paths),
+            batch_mode,
+            str(batch_value),
+            run_uuid
+        ]
     else:
         return {"error": f"Unknown pipeline: {pipeline}"}
 
@@ -131,19 +245,15 @@ async def run_pipeline(req: Request):
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=_build_pipeline_env()
             )
 
-            # Stream stdout
+            # Stream process output
             for line in process.stdout:
                 if line.strip():
                     yield f"data: {json.dumps({'type': 'log', 'message': line.strip()})}\n\n"
-
-            # Stream stderr
-            for line in process.stderr:
-                if line.strip():
-                    yield f"data: {json.dumps({'type': 'log', 'message': '⚠️ ' + line.strip()})}\n\n"
 
             process.wait()
 
@@ -207,7 +317,7 @@ def get_results(run_uuid: str):
         # Get run metadata
         cur.execute("""
             SELECT 
-                pipeline, run_uuid, batch_size, 
+                pipeline, run_uuid, batch_size, batch_mode, batch_interval_seconds,
                 total_records, total_batches, avg_batch_size, 
                 malformed_count, runtime_seconds, status, 
                 started_at, completed_at
@@ -275,7 +385,7 @@ def get_runs():
     try:
         cur.execute("""
             SELECT 
-                pipeline, run_uuid, batch_size,
+                pipeline, run_uuid, batch_size, batch_mode, batch_interval_seconds,
                 total_records, total_batches, avg_batch_size,
                 malformed_count, runtime_seconds, status,
                 started_at, completed_at

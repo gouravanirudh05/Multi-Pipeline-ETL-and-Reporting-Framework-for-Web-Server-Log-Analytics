@@ -1,16 +1,3 @@
-#!/usr/bin/env python3
-# udfs/log_parser.py
-#
-# Pig Python UDF (Jython-compatible) for parsing NASA HTTP log lines.
-#
-# Pig calls register_functions() implicitly when you do:
-#   REGISTER 'udfs/log_parser.py' USING jython AS logudfs;
-#
-# The UDF is called per-row inside a Pig FOREACH statement.
-# Return None for malformed lines so the orchestrator can count them.
-#
-# NOTE: Jython runs inside the JVM, so only the Python stdlib is available.
-#       No third-party packages (re is fine, datetime is fine).
 
 import re
 

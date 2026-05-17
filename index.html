@@ -210,6 +210,34 @@
     line-height: 1.5;
   }
 
+  .segmented {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    padding: 4px;
+    border: 1px solid var(--border2);
+    border-radius: 7px;
+    background: var(--surface3);
+  }
+
+  .segmented button {
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    padding: 7px 8px;
+    cursor: pointer;
+  }
+
+  .segmented button.active {
+    background: var(--surface);
+    color: var(--accent);
+    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.12);
+  }
+
   /* ── Run Button ───────────────────────────────────────────────────── */
   #run-btn {
     width: 100%;
@@ -528,8 +556,19 @@
           <textarea id="log-files" class="form-input" placeholder="/data/NASA_access_log_Jul95&#10;/data/NASA_access_log_Aug95"></textarea>
         </div>
         <div class="form-group">
+          <label class="form-label">Batching mode</label>
+          <div class="segmented">
+            <button type="button" id="batch-records-btn" class="active" onclick="setBatchMode('records')">Records</button>
+            <button type="button" id="batch-time-btn" onclick="setBatchMode('time')">Time window</button>
+          </div>
+        </div>
+        <div class="form-group" id="record-batch-group">
           <label class="form-label">Batch size (records per batch)</label>
-          <input id="batch-size" type="number" class="form-input" value="10000" min="100" max="1000000"/>
+          <input id="batch-size" type="number" class="form-input" value="10000" min="1" max="1000000"/>
+        </div>
+        <div class="form-group" id="time-batch-group" style="display:none;">
+          <label class="form-label">Time window (minutes per batch)</label>
+          <input id="batch-minutes" type="number" class="form-input" value="60" min="1" max="43200"/>
         </div>
       </div>
     </div>
@@ -610,6 +649,8 @@
   pipeline         VARCHAR(20)    -- pig | mapreduce | mongodb | hive
   run_uuid         VARCHAR(64)    PRIMARY KEY
   batch_size       INTEGER
+  batch_mode       VARCHAR(20)    -- records | time
+  batch_interval_seconds INTEGER
   total_records    INTEGER
   total_batches    INTEGER
   avg_batch_size   NUMERIC(10,2)
@@ -671,6 +712,7 @@ const API = "http://localhost:5050";
 let selectedPipeline = null;
 let isRunning = false;
 let logCount = 0;
+let batchMode = "records";
 
 // ── Pipeline Selection ─────────────────────────────────────────────────────
 function selectPipeline(card) {
@@ -687,6 +729,14 @@ function selectPipeline(card) {
     hive: "Run Hive" 
   };
   btn.textContent = labels[selectedPipeline] || "Run Pipeline";
+}
+
+function setBatchMode(mode) {
+  batchMode = mode === "time" ? "time" : "records";
+  document.getElementById("batch-records-btn").classList.toggle("active", batchMode === "records");
+  document.getElementById("batch-time-btn").classList.toggle("active", batchMode === "time");
+  document.getElementById("record-batch-group").style.display = batchMode === "records" ? "flex" : "none";
+  document.getElementById("time-batch-group").style.display = batchMode === "time" ? "flex" : "none";
 }
 
 // ── Tab Switching ──────────────────────────────────────────────────────────
@@ -745,6 +795,8 @@ async function triggerRun() {
 
   const filesRaw  = document.getElementById("log-files").value.trim();
   const batchSize = parseInt(document.getElementById("batch-size").value) || 10000;
+  const batchMinutes = parseInt(document.getElementById("batch-minutes").value) || 60;
+  const batchIntervalSeconds = batchMinutes * 60;
   const logFiles  = filesRaw.split("\n").map(s => s.trim()).filter(Boolean);
 
   if (!logFiles.length) {
@@ -757,14 +809,18 @@ async function triggerRun() {
   const btn = document.getElementById("run-btn");
   btn.disabled = true;
   btn.textContent = "Running...";
+  const batchLabel = batchMode === "time"
+    ? `time_window=${batchMinutes.toLocaleString()} min`
+    : `batch_size=${batchSize.toLocaleString()}`;
   document.getElementById("terminal-title").textContent =
-    `[${selectedPipeline.toUpperCase()}]  batch_size=${batchSize.toLocaleString()}`;
+    `[${selectedPipeline.toUpperCase()}]  ${batchLabel}`;
 
   switchTab("terminal", document.querySelector(".tab-btn"));
   clearLog();
   appendLog(`Starting ${selectedPipeline.toUpperCase()} pipeline...`, "info");
   appendLog(`  Files: ${logFiles.join(", ")}`, "info");
-  appendLog(`  Batch size: ${batchSize.toLocaleString()}`, "info");
+  appendLog(`  Batch mode: ${batchMode}`, "info");
+  appendLog(`  ${batchMode === "time" ? "Time window" : "Batch size"}: ${batchMode === "time" ? batchMinutes.toLocaleString() + " min" : batchSize.toLocaleString()}`, "info");
   appendLog("-".repeat(60), "info");
 
   const iv = animateProgress();
@@ -775,7 +831,9 @@ async function triggerRun() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ 
         pipeline: selectedPipeline, 
+        batch_mode: batchMode,
         batch_size: batchSize, 
+        batch_interval_seconds: batchIntervalSeconds,
         log_files: logFiles 
       })
     });
@@ -879,6 +937,10 @@ function renderResults(data) {
   const pipeColors = { pig:"#334155", mapreduce:"#334155", mongodb:"#0f766e", hive:"#334155" };
   const color = pipeColors[run.pipeline] || "#1d4ed8";
   const status = (run.status || "").toUpperCase();
+  const mode = run.batch_mode || "records";
+  const batchDisplay = mode === "time"
+    ? `${Math.round((run.batch_interval_seconds || 0) / 60)} min`
+    : `${(run.batch_size || 0).toLocaleString()} rec`;
 
   container.innerHTML = `
     <div class="stats-row">
@@ -886,6 +948,8 @@ function renderResults(data) {
       <div class="stat-chip"><div class="sv">${status || '-'}</div><div class="sk">Status</div></div>
       <div class="stat-chip"><div class="sv">${(run.total_records||0).toLocaleString()}</div><div class="sk">Records</div></div>
       <div class="stat-chip"><div class="sv">${run.total_batches||0}</div><div class="sk">Batches</div></div>
+      <div class="stat-chip"><div class="sv">${mode}</div><div class="sk">Batch Mode</div></div>
+      <div class="stat-chip"><div class="sv">${batchDisplay}</div><div class="sk">Batch Unit</div></div>
       <div class="stat-chip"><div class="sv">${run.runtime_seconds ? run.runtime_seconds.toFixed(2)+'s' : '-'}</div><div class="sk">Runtime</div></div>
       <div class="stat-chip"><div class="sv">${run.malformed_count||0}</div><div class="sk">Malformed</div></div>
       <div class="stat-chip"><div class="sv">${run.avg_batch_size ? parseFloat(run.avg_batch_size).toFixed(0) : '-'}</div><div class="sk">Avg Batch</div></div>
@@ -942,7 +1006,7 @@ async function loadHistory() {
         <div class="hist-dot ${r.status}"></div>
         <div class="hist-info">
           <div class="hist-name">${(r.pipeline||'').toUpperCase()}</div>
-          <div class="hist-meta">${(r.total_records||0).toLocaleString()} rec | ${r.total_batches||0} batches | ${r.runtime_seconds ? r.runtime_seconds.toFixed(1)+'s' : '...'}</div>
+          <div class="hist-meta">${(r.total_records||0).toLocaleString()} rec | ${r.total_batches||0} batches | ${(r.batch_mode || 'records')} | ${r.runtime_seconds ? r.runtime_seconds.toFixed(1)+'s' : '...'}</div>
         </div>
         <div class="hist-time">${r.started_at ? new Date(r.started_at).toLocaleTimeString() : ''}</div>
       </div>`).join("");

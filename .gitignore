@@ -218,10 +218,11 @@ tempCodeRunnerFile.py
 
 # Ruff stuff:
 .ruff_cache/
-
+*.pdf
 # PyPI configuration file
 .pypirc
-
+nosql_env/*
+backend/nosql_env/
 # Marimo
 marimo/_static/
 marimo/_lsp/
@@ -249,4 +250,4 @@ NASA_access_log_Jul95
 
 NASA_access_log_Aug95.gz
 NASA_access_log_Jul95.gz
-node_modules    
+node_modules

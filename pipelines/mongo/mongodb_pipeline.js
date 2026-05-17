@@ -4,7 +4,7 @@
 // npm init -y
 // npm install mongodb pg
 // package.json -> "type": "module"
-// node mongodb_pipeline.js <log_file_path_or_json_array> <batch_size> <run_uuid>
+// node mongodb_pipeline.js <log_file_path_or_json_array> <batch_mode> <batch_value> <run_uuid>
 
 import fs from "fs";
 import readline from "readline";
@@ -47,6 +47,41 @@ const MONTH_MAP = {
   Dec: "12",
 };
 
+function parseTimestamp(timestamp) {
+  const match = timestamp.match(
+    /^(\d{2})\/([A-Za-z]{3})\/(\d{4}):(\d{2}):(\d{2}):(\d{2})(?:\s+([+-])(\d{2})(\d{2}))?$/
+  );
+  if (!match) return null;
+
+  const [, day, month, year, hour, minute, second, offsetSign, offsetHour, offsetMinute] =
+    match;
+  const monthNumber = MONTH_MAP[month];
+  if (!monthNumber) return null;
+
+  const logHour = parseInt(hour, 10);
+  const utcMillis = Date.UTC(
+    parseInt(year, 10),
+    parseInt(monthNumber, 10) - 1,
+    parseInt(day, 10),
+    logHour,
+    parseInt(minute, 10),
+    parseInt(second, 10)
+  );
+
+  let offsetMinutes = 0;
+  if (offsetSign && offsetHour && offsetMinute) {
+    offsetMinutes =
+      parseInt(offsetHour, 10) * 60 + parseInt(offsetMinute, 10);
+    if (offsetSign === "-") offsetMinutes *= -1;
+  }
+
+  return {
+    log_date: `${year}-${monthNumber}-${day}`,
+    log_hour: logHour,
+    timestamp_epoch: Math.floor((utcMillis - offsetMinutes * 60000) / 1000),
+  };
+}
+
 // ----------------------
 // Parse a single log line
 // ----------------------
@@ -66,23 +101,28 @@ function parseLogLine(line) {
   ] = match;
 
   try {
-    const datePart = timestamp.split(" ")[0];
-    const [day, month, rest] = datePart.split("/");
-    const [year, hour] = rest.split(":");
+    const parsedTimestamp = parseTimestamp(timestamp);
+    const parsedStatus = parseInt(statusCode, 10);
+    const parsedBytes =
+      bytesTransferred === "-" ? 0 : parseInt(bytesTransferred, 10);
 
-    const logDate = `${year}-${MONTH_MAP[month]}-${day}`;
+    if (
+      !parsedTimestamp ||
+      Number.isNaN(parsedStatus) ||
+      Number.isNaN(parsedBytes)
+    ) {
+      return null;
+    }
 
     return {
       host,
       timestamp,
-      log_date: logDate,
-      log_hour: parseInt(hour),
+      ...parsedTimestamp,
       method,
       resource_path: resourcePath,
       protocol,
-      status_code: parseInt(statusCode),
-      bytes_transferred:
-        bytesTransferred === "-" ? 0 : parseInt(bytesTransferred),
+      status_code: parsedStatus,
+      bytes_transferred: parsedBytes,
     };
   } catch {
     return null;
@@ -107,6 +147,16 @@ async function initializePostgres(pgClient) {
       started_at TIMESTAMPTZ,
       completed_at TIMESTAMPTZ
     );
+  `);
+
+  await pgClient.query(`
+    ALTER TABLE etl_runs
+    ADD COLUMN IF NOT EXISTS batch_mode VARCHAR(20) DEFAULT 'records';
+  `);
+
+  await pgClient.query(`
+    ALTER TABLE etl_runs
+    ADD COLUMN IF NOT EXISTS batch_interval_seconds INTEGER;
   `);
 
   await pgClient.query(`
@@ -399,14 +449,42 @@ function parseLogFilePaths(rawArg) {
   return [rawArg];
 }
 
-async function runPipeline(logFilePaths, batchSize, runUuid, pipeline) {
+function createTimeBatchAssigner(intervalSeconds) {
+  return {
+    firstEpoch: null,
+    windows: new Map(),
+    assign(epochSeconds) {
+      if (this.firstEpoch === null) this.firstEpoch = epochSeconds;
+      const windowIndex = Math.floor(
+        (epochSeconds - this.firstEpoch) / intervalSeconds
+      );
+      if (!this.windows.has(windowIndex)) {
+        this.windows.set(windowIndex, this.windows.size + 1);
+      }
+      return this.windows.get(windowIndex);
+    },
+  };
+}
+
+async function runPipeline(
+  logFilePaths,
+  batchMode,
+  batchValue,
+  runUuid,
+  pipeline
+) {
   const startTime = Date.now();
+  const isTimeBatching = batchMode === "time";
+  const batchLabel = isTimeBatching
+    ? `${batchValue} seconds`
+    : `${batchValue} records`;
 
   console.log(`
 ╔════════════════════════════════════════════════════════════╗
 ║              MongoDB ETL Pipeline Started                  ║
 ║  Run UUID: ${runUuid}
-║  Batch Size: ${batchSize}
+║  Batch Mode: ${batchMode}
+║  Batch Unit: ${batchLabel}
 ╚════════════════════════════════════════════════════════════╝
   `);
 
@@ -420,16 +498,39 @@ async function runPipeline(logFilePaths, batchSize, runUuid, pipeline) {
   const pgClient = new Client(PG_CONFIG);
   await pgClient.connect();
   await initializePostgres(pgClient);
+  await pgClient.query(
+    `
+    INSERT INTO etl_runs
+      (run_uuid, pipeline, batch_size, batch_mode, batch_interval_seconds, status, started_at)
+    VALUES ($1, $2, $3, $4, $5, $6, NOW())
+    ON CONFLICT (run_uuid) DO UPDATE
+    SET pipeline = EXCLUDED.pipeline,
+        batch_size = EXCLUDED.batch_size,
+        batch_mode = EXCLUDED.batch_mode,
+        batch_interval_seconds = EXCLUDED.batch_interval_seconds,
+        status = EXCLUDED.status
+    `,
+    [
+      runUuid,
+      pipeline,
+      isTimeBatching ? null : batchValue,
+      batchMode,
+      isTimeBatching ? batchValue : null,
+      "running",
+    ]
+  );
 
   // Clear any stale records for this run UUID before loading.
   await logsCollection.deleteMany({ run_uuid: runUuid });
 
   let batch = [];
   let batchId = 1;
+  let activeBatchId = 1;
   let malformedRecords = 0;
   let totalRecords = 0;
   let validRecords = 0;
   let totalBatches = 0;
+  const timeBatcher = createTimeBatchAssigner(batchValue);
 
   console.log(`Files to process: ${logFilePaths.length}`);
 
@@ -456,15 +557,30 @@ async function runPipeline(logFilePaths, batchSize, runUuid, pipeline) {
       }
 
       validRecords++;
-      batch.push(parsed);
+      const parsedBatchId = isTimeBatching
+        ? timeBatcher.assign(parsed.timestamp_epoch)
+        : batchId;
 
-      if (batch.length >= batchSize) {
+      if (
+        isTimeBatching &&
+        batch.length > 0 &&
+        parsedBatchId !== activeBatchId
+      ) {
         await processBatch(
           batch,
-          batchId,
+          activeBatchId,
           runUuid,
           logsCollection
         );
+        totalBatches++;
+        batch = [];
+      }
+
+      if (isTimeBatching) activeBatchId = parsedBatchId;
+      batch.push(parsed);
+
+      if (!isTimeBatching && batch.length >= batchValue) {
+        await processBatch(batch, batchId, runUuid, logsCollection);
 
         totalBatches++;
         batchId++;
@@ -477,7 +593,7 @@ async function runPipeline(logFilePaths, batchSize, runUuid, pipeline) {
   if (batch.length > 0) {
     await processBatch(
       batch,
-      batchId,
+      isTimeBatching ? activeBatchId : batchId,
       runUuid,
       logsCollection
     );
@@ -507,8 +623,10 @@ async function runPipeline(logFilePaths, batchSize, runUuid, pipeline) {
         malformed_count = $4,
         runtime_seconds = $5,
         status = $6,
-        completed_at = NOW()
-    WHERE run_uuid = $7
+        completed_at = NOW(),
+        batch_mode = $7,
+        batch_interval_seconds = $8
+    WHERE run_uuid = $9
     `,
     [
       totalRecords,
@@ -517,6 +635,8 @@ async function runPipeline(logFilePaths, batchSize, runUuid, pipeline) {
       malformedRecords,
       runtimeSeconds,
       "completed",
+      batchMode,
+      isTimeBatching ? batchValue : null,
       runUuid,
     ]
   );
@@ -529,6 +649,7 @@ async function runPipeline(logFilePaths, batchSize, runUuid, pipeline) {
 ║  Valid Records:      ${String(validRecords).padEnd(40, ' ')}║
 ║  Malformed:          ${String(malformedRecords).padEnd(40, ' ')}║
 ║  Total Batches:      ${String(totalBatches).padEnd(40, ' ')}║
+║  Batch Mode:         ${String(batchMode).padEnd(40, ' ')}║
 ║  Avg Batch Size:     ${String(avgBatchSize.toFixed(2)).padEnd(40, ' ')}║
 ║  Runtime:            ${String(runtimeSeconds.toFixed(2) + ' sec').padEnd(40, ' ')}║
 ╚════════════════════════════════════════════════════════════╝
@@ -545,16 +666,44 @@ const args = process.argv.slice(2);
 
 if (args.length < 3) {
   console.error(
-    "Usage: node mongodb_pipeline.js <log_file_path_or_json_array> <batch_size> <run_uuid>"
+    "Usage: node mongodb_pipeline.js <log_file_path_or_json_array> <batch_mode> <batch_value> <run_uuid>"
   );
   process.exit(1);
 }
 
-const [logFilePathArg, batchSize, runUuid] = args;
+let logFilePathArg;
+let batchMode;
+let batchValue;
+let runUuid;
+
+if (args.length === 3) {
+  [logFilePathArg, batchValue, runUuid] = args;
+  batchMode = "records";
+} else {
+  [logFilePathArg, batchMode, batchValue, runUuid] = args;
+}
+
+if (!["records", "time"].includes(batchMode)) {
+  console.error("batch_mode must be either records or time");
+  process.exit(1);
+}
+
+const parsedBatchValue = parseInt(batchValue, 10);
+if (!Number.isInteger(parsedBatchValue) || parsedBatchValue <= 0) {
+  console.error("batch_value must be a positive integer");
+  process.exit(1);
+}
+
 const logFilePaths = parseLogFilePaths(logFilePathArg);
 const pipeline = "mongodb";
 
-runPipeline(logFilePaths, parseInt(batchSize), runUuid, pipeline).catch(
+runPipeline(
+  logFilePaths,
+  batchMode,
+  parsedBatchValue,
+  runUuid,
+  pipeline
+).catch(
   (err) => {
     console.error("Pipeline failed:", err);
     process.exit(1);
