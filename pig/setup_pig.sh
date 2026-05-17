@@ -2,9 +2,8 @@
 # setup_pig.sh — One-time installer for Apache Pig 0.17.0
 # -------------------------------------------------------------------
 # Installs Pig to ~/pig (matching the ~/hadoop convention).
-# Pig 0.17.0 is the last stable release.  It includes Jython 2.7
-# for Python UDFs and runs in local mode (-x local) without a
-# Hadoop cluster.
+# Pig 0.17.0 is the last stable release. It includes Jython 2.7
+# for Python UDFs. The project runner executes Pig against Hadoop/HDFS.
 #
 # Usage:
 #   chmod +x pig/setup_pig.sh

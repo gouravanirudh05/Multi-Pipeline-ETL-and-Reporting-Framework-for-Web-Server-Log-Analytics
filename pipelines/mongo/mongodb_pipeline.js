@@ -16,10 +16,11 @@ const { Client } = pg;
 // ----------------------
 // Environment Config
 // ----------------------
-const MONGO_URI = "mongodb://127.0.0.1:27017";
+const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017";
 
 const PG_CONFIG = {
   connectionString:
+    process.env.DATABASE_URL ||
     "postgresql://sathish:welcome@127.0.0.1:5432/nosql_etl_db",
 };
 

@@ -24,11 +24,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR, ".."))
 
 DB_CONFIG = {
-    "dbname": "nosql_etl_db",
-    "user": "sathish",
-    "password": "welcome",
-    "host": "localhost",
-    "port": 5432
+    "dbname": os.environ.get("PGDATABASE", "nosql_etl_db"),
+    "user": os.environ.get("PGUSER", "sathish"),
+    "password": os.environ.get("PGPASSWORD", "welcome"),
+    "host": os.environ.get("PGHOST", "localhost"),
+    "port": int(os.environ.get("PGPORT", "5432")),
 }
 
 def get_conn():
@@ -256,8 +256,8 @@ async def run_pipeline(req: Request):
         ]
     elif pipeline == "pig":
         cmd = [
-            sys.executable,
-            os.path.join(PROJECT_ROOT, "pig", "orchestrator.py"),
+            "bash",
+            os.path.join(PROJECT_ROOT, "pig", "run.sh"),
             json.dumps(log_file_paths),
             batch_mode,
             str(batch_value),
@@ -276,8 +276,8 @@ async def run_pipeline(req: Request):
         ]
     elif pipeline == "hive":
         cmd = [
-            sys.executable,
-            os.path.join(PROJECT_ROOT, "pipelines", "hive", "hive_pipeline.py"),
+            "bash",
+            os.path.join(PROJECT_ROOT, "pipelines", "hive", "run.sh"),
             json.dumps(log_file_paths),
             batch_mode,
             str(batch_value),

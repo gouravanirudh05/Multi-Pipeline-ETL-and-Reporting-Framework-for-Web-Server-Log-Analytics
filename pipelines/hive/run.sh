@@ -2,8 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-UDF_PATH="$SCRIPT_DIR/udfs/log_parser.py"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 usage() {
     echo "Usage: $0 <log_file_path_or_json_array> <batch_mode> <batch_value> <run_uuid> [query]"
@@ -14,7 +13,7 @@ if [[ "$#" -eq 2 ]]; then
     LOG_ARG="$1"
     BATCH_MODE="records"
     BATCH_VALUE="$2"
-    RUN_UUID="pig-cli-$(date +%s)"
+    RUN_UUID="hive-cli-$(date +%s)"
     QUERY="all"
 elif [[ "$#" -ge 4 ]]; then
     LOG_ARG="$1"
@@ -40,18 +39,18 @@ if ! [[ "$BATCH_VALUE" =~ ^[0-9]+$ ]] || [[ "$BATCH_VALUE" -le 0 ]]; then
     exit 1
 fi
 
-PIG_BIN="${PIG_BIN:-}"
-if [[ -z "$PIG_BIN" && -n "${PIG_HOME:-}" && -x "$PIG_HOME/bin/pig" ]]; then
-    PIG_BIN="$PIG_HOME/bin/pig"
+HIVE_BIN="${HIVE_BIN:-}"
+if [[ -z "$HIVE_BIN" && -n "${HIVE_HOME:-}" && -x "$HIVE_HOME/bin/hive" ]]; then
+    HIVE_BIN="$HIVE_HOME/bin/hive"
 fi
-if [[ -z "$PIG_BIN" ]]; then
-    PIG_BIN="$(command -v pig || true)"
+if [[ -z "$HIVE_BIN" ]]; then
+    HIVE_BIN="$(command -v hive || true)"
 fi
-if [[ -z "$PIG_BIN" && -x "$HOME/pig/bin/pig" ]]; then
-    PIG_BIN="$HOME/pig/bin/pig"
+if [[ -z "$HIVE_BIN" && -x "$HOME/hive/bin/hive" ]]; then
+    HIVE_BIN="$HOME/hive/bin/hive"
 fi
-if [[ -z "$PIG_BIN" ]]; then
-    echo "ERROR: pig command not found. Set PIG_HOME/PIG_BIN or add pig to PATH." >&2
+if [[ -z "$HIVE_BIN" ]]; then
+    echo "ERROR: hive command not found. Set HIVE_HOME/HIVE_BIN or add hive to PATH." >&2
     exit 1
 fi
 
@@ -80,6 +79,10 @@ parse_paths() {
     fi
 }
 
+sanitize_name() {
+    printf '%s' "$1" | tr -c 'A-Za-z0-9_' '_' | cut -c 1-96
+}
+
 mapfile -t LOG_FILES < <(parse_paths "$LOG_ARG")
 for log_file in "${LOG_FILES[@]}"; do
     if [[ ! -f "$log_file" ]]; then
@@ -88,20 +91,19 @@ for log_file in "${LOG_FILES[@]}"; do
     fi
 done
 
-BASE_HDFS_DIR="${HDFS_WORK_DIR:-/tmp/nasa-etl/pig/$RUN_UUID}"
+BASE_HDFS_DIR="${HDFS_WORK_DIR:-/tmp/nasa-etl/hive/$RUN_UUID}"
 INPUT_DIR="$BASE_HDFS_DIR/input"
 OUTPUT_DIR="$BASE_HDFS_DIR/output"
+DATABASE="nasa_etl_$(sanitize_name "$RUN_UUID")"
 LOCAL_OUTPUT="$(mktemp -d)"
-COMBINED_PIG="$(mktemp)"
 START_SECONDS="$(date +%s)"
 
 cleanup() {
     rm -rf "$LOCAL_OUTPUT"
-    rm -f "$COMBINED_PIG"
 }
 trap cleanup EXIT
 
-echo "Pig ETL started"
+echo "Hive ETL started"
 echo "Run UUID: $RUN_UUID"
 echo "Batch mode: $BATCH_MODE"
 echo "Batch value: $BATCH_VALUE"
@@ -114,36 +116,32 @@ for log_file in "${LOG_FILES[@]}"; do
     "${DFS_CMD[@]}" -put -f "$log_file" "$INPUT_DIR/"
 done
 
-build_pig_script() {
-    : > "$COMBINED_PIG"
-    cat "$SCRIPT_DIR/common.pig" >> "$COMBINED_PIG"
-    printf '\n' >> "$COMBINED_PIG"
-    cat "$SCRIPT_DIR/metadata.pig" >> "$COMBINED_PIG"
-    printf '\n' >> "$COMBINED_PIG"
-    if [[ "$QUERY" == "all" || "$QUERY" == "q1" ]]; then
-        cat "$SCRIPT_DIR/q1_daily_traffic.pig" >> "$COMBINED_PIG"
-        printf '\n' >> "$COMBINED_PIG"
-    fi
-    if [[ "$QUERY" == "all" || "$QUERY" == "q2" ]]; then
-        cat "$SCRIPT_DIR/q2_top_resources.pig" >> "$COMBINED_PIG"
-        printf '\n' >> "$COMBINED_PIG"
-    fi
-    if [[ "$QUERY" == "all" || "$QUERY" == "q3" ]]; then
-        cat "$SCRIPT_DIR/q3_hourly_errors.pig" >> "$COMBINED_PIG"
-        printf '\n' >> "$COMBINED_PIG"
-    fi
+run_hql() {
+    local script_path="$1"
+    echo "Running Hive script: $(basename "$script_path")"
+    "$HIVE_BIN" \
+        --hiveconf "mapreduce.framework.name=local" \
+        --hiveconf "hive.exec.mode.local.auto=true" \
+        --hivevar "DATABASE=$DATABASE" \
+        --hivevar "INPUT_DIR=$INPUT_DIR" \
+        --hivevar "OUTPUT_DIR=$OUTPUT_DIR" \
+        --hivevar "BATCH_MODE=$BATCH_MODE" \
+        --hivevar "BATCH_VALUE=$BATCH_VALUE" \
+        -f "$script_path"
 }
 
-build_pig_script
-
-"$PIG_BIN" \
-    -Dmapreduce.framework.name=local \
-    -param "INPUT=$INPUT_DIR" \
-    -param "OUTPUT=$OUTPUT_DIR" \
-    -param "UDF_PATH=$UDF_PATH" \
-    -param "BATCH_VALUE=$BATCH_VALUE" \
-    -param "BATCH_BY_TIME=$([[ "$BATCH_MODE" == "time" ]] && echo 1 || echo 0)" \
-    "$COMBINED_PIG"
+run_hql "$SCRIPT_DIR/setup.hql"
+run_hql "$SCRIPT_DIR/metadata.hql"
+if [[ "$QUERY" == "all" || "$QUERY" == "q1" ]]; then
+    run_hql "$SCRIPT_DIR/q1_daily_traffic.hql"
+fi
+if [[ "$QUERY" == "all" || "$QUERY" == "q2" ]]; then
+    run_hql "$SCRIPT_DIR/q2_top_resources.hql"
+fi
+if [[ "$QUERY" == "all" || "$QUERY" == "q3" ]]; then
+    run_hql "$SCRIPT_DIR/q3_hourly_errors.hql"
+fi
+run_hql "$SCRIPT_DIR/cleanup.hql"
 
 merge_output() {
     local hdfs_path="$1"
@@ -163,7 +161,7 @@ merge_output "$OUTPUT_DIR/malformed_records" "$LOCAL_OUTPUT/malformed_records.ts
 
 RUNTIME_SECONDS="$(( $(date +%s) - START_SECONDS ))"
 bash "$PROJECT_ROOT/scripts/load_tsv_to_postgres.sh" \
-    "pig" "$RUN_UUID" "$BATCH_MODE" "$BATCH_VALUE" "$LOCAL_OUTPUT" "$QUERY" "$RUNTIME_SECONDS"
+    "hive" "$RUN_UUID" "$BATCH_MODE" "$BATCH_VALUE" "$LOCAL_OUTPUT" "$QUERY" "$RUNTIME_SECONDS"
 
-echo "Pig ETL completed"
+echo "Hive ETL completed"
 echo "Output HDFS directory: $OUTPUT_DIR"

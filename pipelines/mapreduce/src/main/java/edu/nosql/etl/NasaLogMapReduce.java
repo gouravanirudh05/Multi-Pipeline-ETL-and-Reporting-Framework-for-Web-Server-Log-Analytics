@@ -400,7 +400,6 @@ public class NasaLogMapReduce extends Configured implements Tool {
         String query = args.length >= 5 ? args[4] : "all";
 
         getConf().set("mapreduce.framework.name", "local");
-        getConf().set("fs.defaultFS", "file:///");
 
         if (!"records".equals(batchMode) && !"time".equals(batchMode)) {
             throw new IllegalArgumentException("batch_mode must be records or time");
@@ -672,10 +671,11 @@ public class NasaLogMapReduce extends Configured implements Tool {
         Long activeWindow = null;
 
         for (String inputPath : inputPaths) {
-            BufferedReader reader = Files.newBufferedReader(
-                java.nio.file.Paths.get(inputPath),
-                StandardCharsets.UTF_8
-            );
+            for (Path dataFile : listInputFiles(new Path(inputPath))) {
+                FileSystem fs = dataFile.getFileSystem(getConf());
+                BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(fs.open(dataFile), StandardCharsets.UTF_8)
+                );
             try {
                 String line;
                 while ((line = reader.readLine()) != null) {
@@ -717,8 +717,34 @@ public class NasaLogMapReduce extends Configured implements Tool {
             } finally {
                 reader.close();
             }
+            }
         }
         return stats;
+    }
+
+    private List<Path> listInputFiles(Path inputPath) throws IOException {
+        List<Path> files = new ArrayList<Path>();
+        FileSystem fs = inputPath.getFileSystem(getConf());
+        if (!fs.exists(inputPath)) {
+            throw new IOException("Input path not found: " + inputPath);
+        }
+        FileStatus status = fs.getFileStatus(inputPath);
+        if (status.isFile()) {
+            files.add(inputPath);
+            return files;
+        }
+        for (FileStatus child : fs.listStatus(inputPath)) {
+            String name = child.getPath().getName();
+            if (name.startsWith("_") || name.startsWith(".")) {
+                continue;
+            }
+            if (child.isFile()) {
+                files.add(child.getPath());
+            } else {
+                files.addAll(listInputFiles(child.getPath()));
+            }
+        }
+        return files;
     }
 
     private void appendQ1Inserts(StringBuilder sql, String runUuid, long batchId, Path outputPath)

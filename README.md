@@ -21,9 +21,9 @@ The pipeline reads raw log text directly. Manual preprocessing outside pipeline 
 | Pipeline | Location | Technology |
 |----------|----------|-----------|
 | **MongoDB** | `pipelines/mongo/` | Node.js, MongoDB aggregation framework |
-| **Pig** | `pig/` | Apache Pig 0.17.0 (local mode), Jython UDFs |
-| **MapReduce** | `pipelines/mapreduce/` | Java, Hadoop MapReduce (local mode) |
-| **Hive** | `pipelines/hive/` | Apache Hive 3.1.3, HiveQL (local mode) |
+| **Pig** | `pig/` | Apache Pig 0.17.0 split `.pig` query scripts, local MapReduce execution over HDFS |
+| **MapReduce** | `pipelines/mapreduce/` | Java Hadoop MapReduce, local execution over HDFS |
+| **Hive** | `pipelines/hive/` | Apache Hive 3.1.3 split `.hql` scripts, local MapReduce execution over HDFS |
 
 All pipelines support **record-count batching** and **time-window batching**.
 
@@ -128,6 +128,41 @@ export PATH=$HIVE_HOME/bin:$PATH
 
 ## Running the System
 
+### Docker Run (Portable)
+
+Derby is not a separate service. Hive uses its embedded Derby metastore inside the
+app container at `/app/.hive/metastore_db`; PostgreSQL is still the shared result
+store used by the UI.
+
+```bash
+# 1. Put input logs in the mounted data directory.
+mkdir -p data
+cp access_log_Jul95 data/
+
+# 2. Build and start Postgres, MongoDB, the backend, and HDFS-only Hadoop.
+docker compose up --build
+```
+
+The app container starts only HDFS daemons. It intentionally does not start YARN;
+Pig, Hive, and MapReduce run with `mapreduce.framework.name=local` while reading
+and writing HDFS paths.
+
+Open the UI with `index.html` and use container-visible log paths such as:
+
+```text
+/app/data/access_log_Jul95
+```
+
+Useful container checks:
+
+```bash
+docker compose exec app hdfs dfs -ls /
+docker compose exec app hdfs dfs -ls /tmp/nasa-etl
+docker compose exec app bash -lc './pig/run.sh "[\"/app/data/access_log_Jul95\"]" records 10000 pig-docker all'
+docker compose exec app bash -lc './pipelines/hive/run.sh "[\"/app/data/access_log_Jul95\"]" records 10000 hive-docker all'
+docker compose exec app bash -lc './pipelines/mapreduce/run.sh "[\"/app/data/access_log_Jul95\"]" records 10000 mr-docker all'
+```
+
 ### Web UI (Recommended)
 
 ```bash
@@ -162,8 +197,8 @@ In the UI:
 
 ```bash
 # ── Pig ────────────────────────────────────────────────────────────
-python3 pig/orchestrator.py '["access_log_Jul95"]' records 10000 pig-demo-records
-python3 pig/orchestrator.py '["access_log_Jul95"]' time 3600 pig-demo-time
+./pig/run.sh '["access_log_Jul95"]' records 10000 pig-demo-records
+./pig/run.sh '["access_log_Jul95"]' time 3600 pig-demo-time
 
 # ── MapReduce ──────────────────────────────────────────────────────
 ./pipelines/mapreduce/run.sh '["access_log_Jul95"]' records 10000 mr-demo-records
@@ -175,8 +210,8 @@ node mongodb_pipeline.js '["../../access_log_Jul95"]' records 10000 mongo-demo-r
 cd ../..
 
 # ── Hive ───────────────────────────────────────────────────────────
-python3 pipelines/hive/hive_pipeline.py '["access_log_Jul95"]' records 10000 hive-demo-records
-python3 pipelines/hive/hive_pipeline.py '["access_log_Jul95"]' time 3600 hive-demo-time
+./pipelines/hive/run.sh '["access_log_Jul95"]' records 10000 hive-demo-records
+./pipelines/hive/run.sh '["access_log_Jul95"]' time 3600 hive-demo-time
 ```
 
 ### Batching Modes
@@ -195,10 +230,10 @@ index.html (Browser UI)
     ↓ POST /api/run (SSE streaming)
 backend/server.py (FastAPI :5050)
     ↓ subprocess
-    ├── pig/orchestrator.py          → pig -x local → PostgreSQL
-    ├── pipelines/mapreduce/run.sh   → hadoop jar   → psql → PostgreSQL
+    ├── pig/run.sh                   → hdfs dfs -put → pig etl.pig → PostgreSQL
+    ├── pipelines/mapreduce/run.sh   → hdfs dfs -put → hadoop jar → psql → PostgreSQL
     ├── pipelines/mongo/mongodb_pipeline.js → MongoDB → PostgreSQL
-    └── pipelines/hive/hive_pipeline.py     → hive -f → PostgreSQL
+    └── pipelines/hive/run.sh        → hdfs dfs -put → hive -f *.hql → PostgreSQL
 ```
 
 All pipelines write to the same PostgreSQL tables: `etl_runs`, `batch_metadata`,

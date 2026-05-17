@@ -1,0 +1,10 @@
+.git
+backend/nosql_env
+**/__pycache__
+**/*.pyc
+node_modules
+pipelines/mongo/node_modules
+metastore_db
+derby.log
+.hive
+*.log
