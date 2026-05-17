@@ -1,4 +1,4 @@
-FROM openjdk:8-jdk-bullseye
+FROM eclipse-temurin:8-jdk-jammy
 
 ARG HADOOP_VERSION=3.4.3
 ARG PIG_VERSION=0.17.0
@@ -10,7 +10,7 @@ ENV APP_HOME=/app \
     HIVE_HOME=/opt/hive \
     HADOOP_CONF_DIR=/opt/hadoop/etc/hadoop \
     HIVE_CONF_DIR=/opt/hive/conf \
-    JAVA_HOME=/usr/local/openjdk-8
+    JAVA_HOME=/opt/java/openjdk
 
 ENV PATH="$JAVA_HOME/bin:$HADOOP_HOME/bin:$HADOOP_HOME/sbin:$PIG_HOME/bin:$HIVE_HOME/bin:$PATH"
 

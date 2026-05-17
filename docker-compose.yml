@@ -45,13 +45,13 @@ services:
       PGPASSWORD: welcome
       DATABASE_URL: postgresql://sathish:welcome@postgres:5432/nosql_etl_db
       MONGO_URI: mongodb://mongo:27017
-      JAVA_HOME: /usr/local/openjdk-8
+      JAVA_HOME: /opt/java/openjdk
       HADOOP_HOME: /opt/hadoop
       PIG_HOME: /opt/pig
       HIVE_HOME: /opt/hive
       HADOOP_CONF_DIR: /opt/hadoop/etc/hadoop
       HIVE_CONF_DIR: /opt/hive/conf
-      PATH: /usr/local/openjdk-8/bin:/opt/hadoop/bin:/opt/hadoop/sbin:/opt/pig/bin:/opt/hive/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      PATH: /opt/java/openjdk/bin:/opt/hadoop/bin:/opt/hadoop/sbin:/opt/pig/bin:/opt/hive/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     ports:
       - "5050:5050"
       - "9870:9870"

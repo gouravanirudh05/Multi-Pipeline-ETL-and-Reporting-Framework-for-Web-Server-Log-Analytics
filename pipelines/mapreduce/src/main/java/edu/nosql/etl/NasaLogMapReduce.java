@@ -19,6 +19,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -32,6 +33,7 @@ import org.apache.hadoop.mapreduce.Job;
 import org.apache.hadoop.mapreduce.Mapper;
 import org.apache.hadoop.mapreduce.Reducer;
 import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.input.FileSplit;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
 import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
@@ -217,6 +219,83 @@ public class NasaLogMapReduce extends Configured implements Tool {
             batchId++;
             context.getCounter(PipelineCounter.NON_EMPTY_BATCHES).increment(1);
             context.write(new Text(String.valueOf(batchId)), new LongWritable(count));
+        }
+    }
+
+    public static class BatchMetadataMapper extends Mapper<LongWritable, Text, Text, Text> {
+        @Override
+        protected void map(LongWritable key, Text value, Context context)
+                throws IOException, InterruptedException {
+            FileSplit split = (FileSplit) context.getInputSplit();
+            String sortKey = split.getPath().toString() + "\t"
+                + String.format(Locale.US, "%020d", key.get());
+            context.write(new Text(sortKey), value);
+        }
+    }
+
+    public static class BatchMetadataReducer extends Reducer<Text, Text, Text, Text> {
+        private String batchMode;
+        private long batchValue;
+        private long firstEpoch;
+        private long totalSeen = 0L;
+        private long activeBatchId = 1L;
+        private long nextTimeBatchId = 1L;
+        private final Map<Long, Long> timeWindowBatchIds = new HashMap<Long, Long>();
+        private final Map<Long, BatchStat> batchStats = new TreeMap<Long, BatchStat>();
+
+        @Override
+        protected void setup(Context context) {
+            batchMode = context.getConfiguration().get("nasa.batch.mode", "records");
+            batchValue = context.getConfiguration().getLong("nasa.batch.value", 10000L);
+            firstEpoch = context.getConfiguration().getLong("nasa.batch.first.epoch", 0L);
+        }
+
+        @Override
+        protected void reduce(Text key, Iterable<Text> values, Context context)
+                throws IOException, InterruptedException {
+            for (Text value : values) {
+                String line = value.toString();
+                totalSeen++;
+
+                ParsedLog parsed = parseLogLine(line);
+                long batchId;
+                if ("records".equals(batchMode)) {
+                    batchId = ((totalSeen - 1L) / batchValue) + 1L;
+                } else if (parsed != null) {
+                    long window = Math.floorDiv(parsed.epochSeconds - firstEpoch, batchValue);
+                    Long existingBatchId = timeWindowBatchIds.get(window);
+                    if (existingBatchId == null) {
+                        existingBatchId = nextTimeBatchId++;
+                        timeWindowBatchIds.put(window, existingBatchId);
+                    }
+                    batchId = existingBatchId.longValue();
+                    activeBatchId = batchId;
+                } else {
+                    batchId = activeBatchId;
+                }
+
+                BatchStat stat = batchStats.get(batchId);
+                if (stat == null) {
+                    stat = new BatchStat(batchId);
+                    batchStats.put(batchId, stat);
+                }
+                stat.recordsProcessed++;
+
+                if (parsed == null) {
+                    stat.malformedCount++;
+                    context.write(new Text("M|" + batchId), new Text(line + "\tparse_failed"));
+                }
+            }
+        }
+
+        @Override
+        protected void cleanup(Context context) throws IOException, InterruptedException {
+            for (BatchStat stat : batchStats.values()) {
+                context.write(
+                    new Text("B|" + stat.batchId),
+                    new Text(batchValue + "\t" + stat.recordsProcessed + "\t" + stat.malformedCount)
+                );
+            }
         }
     }
 
@@ -442,7 +521,28 @@ public class NasaLogMapReduce extends Configured implements Tool {
         long malformedRecords = metadataJob.getCounters()
             .findCounter(PipelineCounter.MALFORMED_LINES)
             .getValue();
-        List<BatchStat> batchStats = computeBatchStats(batchMode, batchValue, inputPaths);
+        long firstEpoch = readMinEpoch(metadataOutput);
+        Path batchMetadataOutput = new Path(baseOutput, "batch_metadata");
+        Job batchMetadataJob = createJob(
+            "nasa-batch-metadata",
+            BatchMetadataMapper.class,
+            BatchMetadataReducer.class,
+            batchMetadataOutput
+        );
+        batchMetadataJob.getConfiguration().set("nasa.batch.mode", batchMode);
+        batchMetadataJob.getConfiguration().setLong("nasa.batch.value", batchValue);
+        batchMetadataJob.getConfiguration().setLong("nasa.batch.first.epoch", firstEpoch);
+        batchMetadataJob.setMapOutputKeyClass(Text.class);
+        batchMetadataJob.setMapOutputValueClass(Text.class);
+        batchMetadataJob.setOutputKeyClass(Text.class);
+        batchMetadataJob.setOutputValueClass(Text.class);
+        batchMetadataJob.setNumReduceTasks(1);
+        addInputs(batchMetadataJob, inputPaths);
+        if (!batchMetadataJob.waitForCompletion(true)) {
+            throw new IllegalStateException("Batch metadata MapReduce job failed");
+        }
+
+        List<BatchStat> batchStats = readBatchStats(batchMetadataOutput);
         long totalBatches = batchStats.size();
 
         Path q1Output = null;
@@ -534,37 +634,6 @@ public class NasaLogMapReduce extends Configured implements Tool {
         }
     }
 
-    private long calculateTotalBatches(String batchMode, int batchValue, long totalRecords,
-            long validRecords, long minEpoch, List<String> inputPaths, Path windowOutput)
-            throws Exception {
-        if ("records".equals(batchMode)) {
-            return totalRecords == 0 ? 0 : (totalRecords + batchValue - 1) / batchValue;
-        }
-        if (validRecords == 0) {
-            return totalRecords == 0 ? 0 : 1;
-        }
-
-        Job windowJob = createJob(
-            "nasa-time-window-batches",
-            TimeWindowMapper.class,
-            TimeWindowReducer.class,
-            windowOutput
-        );
-        windowJob.getConfiguration().setLong("nasa.batch.first.epoch", minEpoch);
-        windowJob.getConfiguration().setLong("nasa.batch.interval.seconds", batchValue);
-        windowJob.setMapOutputKeyClass(LongWritable.class);
-        windowJob.setMapOutputValueClass(LongWritable.class);
-        windowJob.setOutputKeyClass(Text.class);
-        windowJob.setOutputValueClass(LongWritable.class);
-        windowJob.setNumReduceTasks(1);
-        addInputs(windowJob, inputPaths);
-
-        if (!windowJob.waitForCompletion(true)) {
-            throw new IllegalStateException("Time-window batch MapReduce job failed");
-        }
-        return windowJob.getCounters().findCounter(PipelineCounter.NON_EMPTY_BATCHES).getValue();
-    }
-
     private long readMinEpoch(Path metadataOutput) throws IOException {
         for (String line : readPartLines(metadataOutput)) {
             String[] parts = line.split("\\t", -1);
@@ -573,6 +642,37 @@ public class NasaLogMapReduce extends Configured implements Tool {
             }
         }
         return 0L;
+    }
+
+    private List<BatchStat> readBatchStats(Path outputPath) throws IOException {
+        Map<Long, BatchStat> stats = new TreeMap<Long, BatchStat>();
+        for (String line : readPartLines(outputPath)) {
+            String[] parts = line.split("\\t", -1);
+            if (parts.length < 2) {
+                continue;
+            }
+            if (parts[0].startsWith("B|")) {
+                long batchId = Long.parseLong(parts[0].substring(2));
+                BatchStat stat = stats.get(batchId);
+                if (stat == null) {
+                    stat = new BatchStat(batchId);
+                    stats.put(batchId, stat);
+                }
+                if (parts.length >= 4) {
+                    stat.recordsProcessed = Long.parseLong(parts[2]);
+                    stat.malformedCount = Long.parseLong(parts[3]);
+                }
+            } else if (parts[0].startsWith("M|")) {
+                long batchId = Long.parseLong(parts[0].substring(2));
+                BatchStat stat = stats.get(batchId);
+                if (stat == null) {
+                    stat = new BatchStat(batchId);
+                    stats.put(batchId, stat);
+                }
+                stat.malformedLines.add(parts[1]);
+            }
+        }
+        return new ArrayList<BatchStat>(stats.values());
     }
 
     private void loadPostgres(String runUuid, String batchMode, int batchValue,
@@ -660,91 +760,6 @@ public class NasaLogMapReduce extends Configured implements Tool {
                 .append(sqlString(runUuid)).append(", 'mapreduce', 0, ")
                 .append(malformedRecords).append(");\n");
         }
-    }
-
-    private List<BatchStat> computeBatchStats(String batchMode, int batchValue, List<String> inputPaths)
-            throws IOException {
-        List<BatchStat> stats = new ArrayList<BatchStat>();
-        Map<Long, BatchStat> byTimeWindow = new HashMap<Long, BatchStat>();
-        long totalSeen = 0L;
-        Long firstEpoch = null;
-        Long activeWindow = null;
-
-        for (String inputPath : inputPaths) {
-            for (Path dataFile : listInputFiles(new Path(inputPath))) {
-                FileSystem fs = dataFile.getFileSystem(getConf());
-                BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(fs.open(dataFile), StandardCharsets.UTF_8)
-                );
-            try {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    totalSeen++;
-                    ParsedLog parsed = parseLogLine(line);
-                    long batchId;
-                    if ("records".equals(batchMode)) {
-                        batchId = ((totalSeen - 1L) / (long) batchValue) + 1L;
-                        while (stats.size() < batchId) {
-                            stats.add(new BatchStat(stats.size() + 1L));
-                        }
-                    } else {
-                        long window;
-                        if (parsed != null) {
-                            if (firstEpoch == null) {
-                                firstEpoch = parsed.epochSeconds;
-                            }
-                            window = Math.floorDiv(parsed.epochSeconds - firstEpoch.longValue(), (long) batchValue);
-                            activeWindow = window;
-                        } else {
-                            window = activeWindow == null ? 0L : activeWindow.longValue();
-                        }
-                        BatchStat existing = byTimeWindow.get(window);
-                        if (existing == null) {
-                            existing = new BatchStat(byTimeWindow.size() + 1L);
-                            byTimeWindow.put(window, existing);
-                            stats.add(existing);
-                        }
-                        batchId = existing.batchId;
-                    }
-
-                    BatchStat stat = stats.get((int) batchId - 1);
-                    stat.recordsProcessed++;
-                    if (parsed == null) {
-                        stat.malformedCount++;
-                        stat.malformedLines.add(line);
-                    }
-                }
-            } finally {
-                reader.close();
-            }
-            }
-        }
-        return stats;
-    }
-
-    private List<Path> listInputFiles(Path inputPath) throws IOException {
-        List<Path> files = new ArrayList<Path>();
-        FileSystem fs = inputPath.getFileSystem(getConf());
-        if (!fs.exists(inputPath)) {
-            throw new IOException("Input path not found: " + inputPath);
-        }
-        FileStatus status = fs.getFileStatus(inputPath);
-        if (status.isFile()) {
-            files.add(inputPath);
-            return files;
-        }
-        for (FileStatus child : fs.listStatus(inputPath)) {
-            String name = child.getPath().getName();
-            if (name.startsWith("_") || name.startsWith(".")) {
-                continue;
-            }
-            if (child.isFile()) {
-                files.add(child.getPath());
-            } else {
-                files.addAll(listInputFiles(child.getPath()));
-            }
-        }
-        return files;
     }
 
     private void appendQ1Inserts(StringBuilder sql, String runUuid, long batchId, Path outputPath)
