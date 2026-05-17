@@ -164,6 +164,43 @@ async function initializePostgres(pgClient) {
   `);
 
   await pgClient.query(`
+    CREATE TABLE IF NOT EXISTS batch_metadata (
+      id SERIAL PRIMARY KEY,
+      run_uuid VARCHAR(64),
+      pipeline VARCHAR(20),
+      batch_id INTEGER,
+      batch_size INTEGER,
+      records_processed INTEGER,
+      malformed_count INTEGER DEFAULT 0,
+      started_at TIMESTAMPTZ DEFAULT NOW(),
+      completed_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  await pgClient.query(`
+    CREATE TABLE IF NOT EXISTS malformed_record_summary (
+      id SERIAL PRIMARY KEY,
+      run_uuid VARCHAR(64),
+      pipeline VARCHAR(20),
+      batch_id INTEGER,
+      malformed_count INTEGER,
+      recorded_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  await pgClient.query(`
+    CREATE TABLE IF NOT EXISTS malformed_records (
+      id SERIAL PRIMARY KEY,
+      run_uuid VARCHAR(64),
+      pipeline VARCHAR(20),
+      batch_id INTEGER,
+      raw_line TEXT,
+      reason TEXT,
+      recorded_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  await pgClient.query(`
     CREATE TABLE IF NOT EXISTS daily_traffic (
       id SERIAL PRIMARY KEY,
       pipeline VARCHAR(20),
@@ -206,6 +243,13 @@ async function initializePostgres(pgClient) {
       distinct_error_hosts BIGINT
     );
   `);
+
+  await pgClient.query(`CREATE INDEX IF NOT EXISTS idx_batch_run ON batch_metadata(run_uuid, batch_id);`);
+  await pgClient.query(`CREATE INDEX IF NOT EXISTS idx_malformed_summary_run ON malformed_record_summary(run_uuid, batch_id);`);
+  await pgClient.query(`CREATE INDEX IF NOT EXISTS idx_malformed_records_run ON malformed_records(run_uuid, batch_id);`);
+  await pgClient.query(`CREATE INDEX IF NOT EXISTS idx_daily_pipeline_date ON daily_traffic(pipeline, log_date);`);
+  await pgClient.query(`CREATE INDEX IF NOT EXISTS idx_resource_pipeline ON top_resources(pipeline, request_count DESC);`);
+  await pgClient.query(`CREATE INDEX IF NOT EXISTS idx_error_pipeline_date ON hourly_errors(pipeline, log_date, log_hour);`);
 }
 
 // ----------------------
@@ -237,26 +281,34 @@ async function writeFinalAggregates(
   pipeline,
   totalBatches,
   logsCollection,
-  pgClient
+  pgClient,
+  query
 ) {
   const resultBatchId = totalBatches;
 
-  await pgClient.query("DELETE FROM daily_traffic WHERE run_uuid = $1", [
-    runUuid,
-  ]);
-  await pgClient.query("DELETE FROM top_resources WHERE run_uuid = $1", [
-    runUuid,
-  ]);
-  await pgClient.query("DELETE FROM hourly_errors WHERE run_uuid = $1", [
-    runUuid,
-  ]);
+  if (query === "all" || query === "q1") {
+    await pgClient.query("DELETE FROM daily_traffic WHERE run_uuid = $1", [
+      runUuid,
+    ]);
+  }
+  if (query === "all" || query === "q2") {
+    await pgClient.query("DELETE FROM top_resources WHERE run_uuid = $1", [
+      runUuid,
+    ]);
+  }
+  if (query === "all" || query === "q3") {
+    await pgClient.query("DELETE FROM hourly_errors WHERE run_uuid = $1", [
+      runUuid,
+    ]);
+  }
 
   // ----------------------
   // Query 1: Daily Traffic Summary
   // ----------------------
-  console.log("Running Q1 (Daily Traffic) over full run...");
-  const dailySummary = await logsCollection
-    .aggregate(
+  if (query === "all" || query === "q1") {
+    console.log("Running Q1 (Daily Traffic) over full run...");
+    const dailySummary = await logsCollection
+      .aggregate(
       [
         { $match: { run_uuid: runUuid } },
         {
@@ -271,34 +323,36 @@ async function writeFinalAggregates(
         },
       ],
       { allowDiskUse: true }
-    )
-    .toArray();
+      )
+      .toArray();
 
-  for (const row of dailySummary) {
-    await pgClient.query(
-      `
-      INSERT INTO daily_traffic
-      (pipeline, run_uuid, batch_id, log_date, status_code, request_count, total_bytes)
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
-      `,
-      [
-        pipeline,
-        runUuid,
-        resultBatchId,
-        row._id.log_date,
-        row._id.status_code,
-        row.request_count,
-        row.total_bytes,
-      ]
-    );
+    for (const row of dailySummary) {
+      await pgClient.query(
+        `
+        INSERT INTO daily_traffic
+        (pipeline, run_uuid, batch_id, log_date, status_code, request_count, total_bytes)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        `,
+        [
+          pipeline,
+          runUuid,
+          resultBatchId,
+          row._id.log_date,
+          row._id.status_code,
+          row.request_count,
+          row.total_bytes,
+        ]
+      );
+    }
   }
 
   // ----------------------
   // Query 2: Top Requested Resources
   // ----------------------
-  console.log("Running Q2 (Top Resources) over full run...");
-  const topResources = await logsCollection
-    .aggregate(
+  if (query === "all" || query === "q2") {
+    console.log("Running Q2 (Top Resources) over full run...");
+    const topResources = await logsCollection
+      .aggregate(
       [
         { $match: { run_uuid: runUuid } },
         {
@@ -321,34 +375,36 @@ async function writeFinalAggregates(
         { $limit: 20 },
       ],
       { allowDiskUse: true }
-    )
-    .toArray();
+      )
+      .toArray();
 
-  for (const row of topResources) {
-    await pgClient.query(
-      `
-      INSERT INTO top_resources
-      (pipeline, run_uuid, batch_id, resource_path, request_count, total_bytes, distinct_host_count)
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
-      `,
-      [
-        pipeline,
-        runUuid,
-        resultBatchId,
-        row.resource_path,
-        row.request_count,
-        row.total_bytes,
-        row.distinct_host_count,
-      ]
-    );
+    for (const row of topResources) {
+      await pgClient.query(
+        `
+        INSERT INTO top_resources
+        (pipeline, run_uuid, batch_id, resource_path, request_count, total_bytes, distinct_host_count)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        `,
+        [
+          pipeline,
+          runUuid,
+          resultBatchId,
+          row.resource_path,
+          row.request_count,
+          row.total_bytes,
+          row.distinct_host_count,
+        ]
+      );
+    }
   }
 
   // ----------------------
   // Query 3: Hourly Error Analysis
   // ----------------------
-  console.log("Running Q3 (Hourly Errors) over full run...");
-  const hourlyErrors = await logsCollection
-    .aggregate(
+  if (query === "all" || query === "q3") {
+    console.log("Running Q3 (Hourly Errors) over full run...");
+    const hourlyErrors = await logsCollection
+      .aggregate(
       [
         { $match: { run_uuid: runUuid } },
         {
@@ -410,33 +466,73 @@ async function writeFinalAggregates(
         },
       ],
       { allowDiskUse: true }
-    )
-    .toArray();
+      )
+      .toArray();
 
-  for (const row of hourlyErrors) {
-    await pgClient.query(
-      `
-      INSERT INTO hourly_errors
-      (pipeline, run_uuid, batch_id, log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-      `,
-      [
-        pipeline,
-        runUuid,
-        resultBatchId,
-        row.log_date,
-        row.log_hour,
-        row.error_requests,
-        row.total_requests,
-        row.error_rate,
-        row.distinct_error_hosts,
-      ]
-    );
+    for (const row of hourlyErrors) {
+      await pgClient.query(
+        `
+        INSERT INTO hourly_errors
+        (pipeline, run_uuid, batch_id, log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        `,
+        [
+          pipeline,
+          runUuid,
+          resultBatchId,
+          row.log_date,
+          row.log_hour,
+          row.error_requests,
+          row.total_requests,
+          row.error_rate,
+          row.distinct_error_hosts,
+        ]
+      );
+    }
   }
 
   console.log(
     `Final aggregates written to PostgreSQL after ${totalBatches} source batches`
   );
+}
+
+async function writeBatchMetadata(pgClient, runUuid, pipeline, batchValue, batchStats) {
+  await pgClient.query("DELETE FROM batch_metadata WHERE run_uuid = $1", [runUuid]);
+  await pgClient.query("DELETE FROM malformed_record_summary WHERE run_uuid = $1", [runUuid]);
+  await pgClient.query("DELETE FROM malformed_records WHERE run_uuid = $1", [runUuid]);
+
+  const batchIds = [...batchStats.keys()].sort((a, b) => a - b);
+  for (const batchId of batchIds) {
+    const stats = batchStats.get(batchId);
+    await pgClient.query(
+      `
+      INSERT INTO batch_metadata
+        (run_uuid, pipeline, batch_id, batch_size, records_processed, malformed_count)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      `,
+      [runUuid, pipeline, batchId, batchValue, stats.records, stats.malformed]
+    );
+    if (stats.malformed > 0) {
+      await pgClient.query(
+        `
+        INSERT INTO malformed_record_summary
+          (run_uuid, pipeline, batch_id, malformed_count)
+        VALUES ($1, $2, $3, $4)
+        `,
+        [runUuid, pipeline, batchId, stats.malformed]
+      );
+    }
+    for (const rawLine of stats.malformedLines || []) {
+      await pgClient.query(
+        `
+        INSERT INTO malformed_records
+          (run_uuid, pipeline, batch_id, raw_line, reason)
+        VALUES ($1, $2, $3, $4, $5)
+        `,
+        [runUuid, pipeline, batchId, rawLine, "parse_failed"]
+      );
+    }
+  }
 }
 
 // ----------------------
@@ -475,7 +571,8 @@ async function runPipeline(
   batchMode,
   batchValue,
   runUuid,
-  pipeline
+  pipeline,
+  query = "all"
 ) {
   const startTime = Date.now();
   const isTimeBatching = batchMode === "time";
@@ -528,13 +625,20 @@ async function runPipeline(
   await logsCollection.deleteMany({ run_uuid: runUuid });
 
   let batch = [];
-  let batchId = 1;
   let activeBatchId = 1;
   let malformedRecords = 0;
   let totalRecords = 0;
   let validRecords = 0;
   let totalBatches = 0;
   const timeBatcher = createTimeBatchAssigner(batchValue);
+  const batchStats = new Map();
+
+  function ensureBatchStats(id) {
+    if (!batchStats.has(id)) {
+      batchStats.set(id, { records: 0, malformed: 0 });
+    }
+    return batchStats.get(id);
+  }
 
   console.log(`Files to process: ${logFilePaths.length}`);
 
@@ -552,21 +656,31 @@ async function runPipeline(
 
     for await (const line of rl) {
       totalRecords++;
+      let rawBatchId = isTimeBatching
+        ? activeBatchId
+        : Math.floor((totalRecords - 1) / batchValue) + 1;
 
       const parsed = parseLogLine(line);
 
+      if (isTimeBatching && parsed) {
+        rawBatchId = timeBatcher.assign(parsed.timestamp_epoch);
+      }
+
+      const stats = ensureBatchStats(rawBatchId);
+      stats.records++;
+
       if (!parsed) {
         malformedRecords++;
+        stats.malformed++;
+        if (!stats.malformedLines) stats.malformedLines = [];
+        stats.malformedLines.push(line);
         continue;
       }
 
       validRecords++;
-      const parsedBatchId = isTimeBatching
-        ? timeBatcher.assign(parsed.timestamp_epoch)
-        : batchId;
+      const parsedBatchId = rawBatchId;
 
       if (
-        isTimeBatching &&
         batch.length > 0 &&
         parsedBatchId !== activeBatchId
       ) {
@@ -580,16 +694,8 @@ async function runPipeline(
         batch = [];
       }
 
-      if (isTimeBatching) activeBatchId = parsedBatchId;
+      activeBatchId = parsedBatchId;
       batch.push(parsed);
-
-      if (!isTimeBatching && batch.length >= batchValue) {
-        await processBatch(batch, batchId, runUuid, logsCollection);
-
-        totalBatches++;
-        batchId++;
-        batch = [];
-      }
     }
   }
 
@@ -597,20 +703,24 @@ async function runPipeline(
   if (batch.length > 0) {
     await processBatch(
       batch,
-      isTimeBatching ? activeBatchId : batchId,
+      activeBatchId,
       runUuid,
       logsCollection
     );
 
     totalBatches++;
   }
+  totalBatches = Math.max(totalBatches, batchStats.size);
+
+  await writeBatchMetadata(pgClient, runUuid, pipeline, batchValue, batchStats);
 
   await writeFinalAggregates(
     runUuid,
     pipeline,
     totalBatches,
     logsCollection,
-    pgClient
+    pgClient,
+    query
   );
 
   const runtimeSeconds = (Date.now() - startTime) / 1000;
@@ -679,16 +789,21 @@ let logFilePathArg;
 let batchMode;
 let batchValue;
 let runUuid;
+let query = "all";
 
 if (args.length === 3) {
   [logFilePathArg, batchValue, runUuid] = args;
   batchMode = "records";
 } else {
-  [logFilePathArg, batchMode, batchValue, runUuid] = args;
+  [logFilePathArg, batchMode, batchValue, runUuid, query = "all"] = args;
 }
 
 if (!["records", "time"].includes(batchMode)) {
   console.error("batch_mode must be either records or time");
+  process.exit(1);
+}
+if (!["all", "q1", "q2", "q3"].includes(query)) {
+  console.error("query must be one of: all, q1, q2, q3");
   process.exit(1);
 }
 
@@ -706,7 +821,8 @@ runPipeline(
   batchMode,
   parsedBatchValue,
   runUuid,
-  pipeline
+  pipeline,
+  query
 ).catch(
   (err) => {
     console.error("Pipeline failed:", err);

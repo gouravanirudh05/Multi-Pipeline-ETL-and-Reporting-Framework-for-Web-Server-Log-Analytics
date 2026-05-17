@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 import csv
 import json
-import math
 import os
-import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
 
 import psycopg2
 
@@ -24,27 +21,6 @@ PG_CONFIG = {
     "dbname": os.environ.get("PGDATABASE", "nosql_etl_db"),
     "user": os.environ.get("PGUSER", "sathish"),
     "password": os.environ.get("PGPASSWORD", "welcome"),
-}
-
-LOG_PATTERN = re.compile(
-    r'^(\S+) \S+ \S+ \[(.*?)\] "(\S+) (.*?) (\S+)" (\d{3}) (\S+)'
-)
-TS_PATTERN = re.compile(
-    r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2})(?:\s+([+-])(\d{2})(\d{2}))?$'
-)
-MONTH_MAP = {
-    "Jan": 1,
-    "Feb": 2,
-    "Mar": 3,
-    "Apr": 4,
-    "May": 5,
-    "Jun": 6,
-    "Jul": 7,
-    "Aug": 8,
-    "Sep": 9,
-    "Oct": 10,
-    "Nov": 11,
-    "Dec": 12,
 }
 
 
@@ -63,45 +39,11 @@ def find_pig_bin():
     if path_candidate:
         return path_candidate
 
-    local_candidate = os.path.join(SCRIPT_DIR, "pig", "bin", "pig")
-    if os.path.isfile(local_candidate):
-        return local_candidate
-
-    # Standard install location (matches ~/hadoop convention)
     home_candidate = os.path.join(os.path.expanduser("~"), "pig", "bin", "pig")
     if os.path.isfile(home_candidate):
         return home_candidate
 
     return None
-
-
-def parse_log_epoch(line):
-    match = LOG_PATTERN.match(line.strip())
-    if not match:
-        return None
-
-    timestamp = match.group(2)
-    ts_match = TS_PATTERN.match(timestamp)
-    if not ts_match:
-        return None
-
-    try:
-        day = int(ts_match.group(1))
-        month = MONTH_MAP.get(ts_match.group(2))
-        if month is None:
-            return None
-        year = int(ts_match.group(3))
-        hour = int(ts_match.group(4))
-        minute = int(ts_match.group(5))
-        second = int(ts_match.group(6))
-        sign = ts_match.group(7)
-        offset = timezone.utc
-        if sign:
-            offset_text = f"{sign}{ts_match.group(8)}{ts_match.group(9)}"
-            offset = datetime.strptime(offset_text, "%z").tzinfo
-        return int(datetime(year, month, day, hour, minute, second, tzinfo=offset).timestamp())
-    except Exception:
-        return None
 
 
 def parse_path_list(raw):
@@ -112,80 +54,6 @@ def parse_path_list(raw):
     except Exception:
         pass
     return [raw]
-
-
-def write_records_batch(line, tmp_dir, batch_id, current_file, current_count):
-    if current_file is None:
-        path = os.path.join(tmp_dir, f"batch_{batch_id:04d}.log")
-        current_file = open(path, "w", encoding="utf-8")
-    current_file.write(line)
-    return current_file, current_count + 1
-
-
-def split_batches(log_file_paths, batch_mode, batch_value, tmp_dir, combined_path):
-    chunks = []
-    total_records = 0
-    current_file = None
-    current_path = None
-    current_count = 0
-    batch_id = 1
-    first_epoch = None
-    active_window = None
-
-    with open(combined_path, "w", encoding="utf-8") as combined:
-        for log_path in log_file_paths:
-            if not os.path.isfile(log_path):
-                raise FileNotFoundError(f"Log file not found: {log_path}")
-
-            with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    total_records += 1
-                    combined.write(line)
-
-                    if batch_mode == "records":
-                        if current_file is None:
-                            current_path = os.path.join(tmp_dir, f"batch_{batch_id:04d}.log")
-                            current_file = open(current_path, "w", encoding="utf-8")
-                        current_file.write(line)
-                        current_count += 1
-                        if current_count >= batch_value:
-                            current_file.close()
-                            chunks.append((current_path, current_count))
-                            batch_id += 1
-                            current_file = None
-                            current_path = None
-                            current_count = 0
-                        continue
-
-                    epoch = parse_log_epoch(line)
-                    if epoch is not None:
-                        if first_epoch is None:
-                            first_epoch = epoch
-                        window = math.floor((epoch - first_epoch) / batch_value)
-                    else:
-                        window = active_window if active_window is not None else 0
-
-                    if current_file is None:
-                        active_window = window
-                        current_path = os.path.join(tmp_dir, f"batch_{batch_id:04d}.log")
-                        current_file = open(current_path, "w", encoding="utf-8")
-                    elif window != active_window:
-                        current_file.close()
-                        chunks.append((current_path, current_count))
-                        batch_id += 1
-                        active_window = window
-                        current_path = os.path.join(tmp_dir, f"batch_{batch_id:04d}.log")
-                        current_file = open(current_path, "w", encoding="utf-8")
-                        current_count = 0
-
-                    current_file.write(line)
-                    current_count += 1
-
-    if current_file is not None:
-        current_file.close()
-        chunks.append((current_path, current_count))
-
-    return chunks, total_records
 
 
 def pg_connect():
@@ -209,13 +77,41 @@ def init_postgres(conn):
                 completed_at TIMESTAMPTZ
             )
         """)
+        cur.execute("ALTER TABLE etl_runs ADD COLUMN IF NOT EXISTS batch_mode VARCHAR(20) DEFAULT 'records'")
+        cur.execute("ALTER TABLE etl_runs ADD COLUMN IF NOT EXISTS batch_interval_seconds INTEGER")
         cur.execute("""
-            ALTER TABLE etl_runs
-            ADD COLUMN IF NOT EXISTS batch_mode VARCHAR(20) DEFAULT 'records'
+            CREATE TABLE IF NOT EXISTS batch_metadata (
+                id SERIAL PRIMARY KEY,
+                run_uuid VARCHAR(64),
+                pipeline VARCHAR(20),
+                batch_id INTEGER,
+                batch_size INTEGER,
+                records_processed INTEGER,
+                malformed_count INTEGER DEFAULT 0,
+                started_at TIMESTAMPTZ DEFAULT NOW(),
+                completed_at TIMESTAMPTZ DEFAULT NOW()
+            )
         """)
         cur.execute("""
-            ALTER TABLE etl_runs
-            ADD COLUMN IF NOT EXISTS batch_interval_seconds INTEGER
+            CREATE TABLE IF NOT EXISTS malformed_record_summary (
+                id SERIAL PRIMARY KEY,
+                run_uuid VARCHAR(64),
+                pipeline VARCHAR(20),
+                batch_id INTEGER,
+                malformed_count INTEGER,
+                recorded_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS malformed_records (
+                id SERIAL PRIMARY KEY,
+                run_uuid VARCHAR(64),
+                pipeline VARCHAR(20),
+                batch_id INTEGER,
+                raw_line TEXT,
+                reason TEXT,
+                recorded_at TIMESTAMPTZ DEFAULT NOW()
+            )
         """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS daily_traffic (
@@ -258,6 +154,12 @@ def init_postgres(conn):
                 distinct_error_hosts BIGINT
             )
         """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_batch_run ON batch_metadata(run_uuid, batch_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_malformed_summary_run ON malformed_record_summary(run_uuid, batch_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_malformed_records_run ON malformed_records(run_uuid, batch_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_daily_pipeline_date ON daily_traffic(pipeline, log_date)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_resource_pipeline ON top_resources(pipeline, request_count DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_error_pipeline_date ON hourly_errors(pipeline, log_date, log_hour)")
     conn.commit()
 
 
@@ -279,9 +181,15 @@ def start_run(conn, run_uuid, batch_mode, batch_value):
             batch_mode,
             batch_value if batch_mode == "time" else None,
         ))
-        cur.execute("DELETE FROM daily_traffic WHERE run_uuid = %s", (run_uuid,))
-        cur.execute("DELETE FROM top_resources WHERE run_uuid = %s", (run_uuid,))
-        cur.execute("DELETE FROM hourly_errors WHERE run_uuid = %s", (run_uuid,))
+        for table in (
+            "daily_traffic",
+            "top_resources",
+            "hourly_errors",
+            "batch_metadata",
+            "malformed_record_summary",
+            "malformed_records",
+        ):
+            cur.execute(f"DELETE FROM {table} WHERE run_uuid = %s", (run_uuid,))
     conn.commit()
 
 
@@ -315,32 +223,21 @@ def finish_run(conn, run_uuid, total_records, total_batches, avg_batch_size,
 
 def fail_run(conn, run_uuid):
     with conn.cursor() as cur:
-        cur.execute("""
-            UPDATE etl_runs
-            SET status = 'failed', completed_at = NOW()
-            WHERE run_uuid = %s
-        """, (run_uuid,))
+        cur.execute("UPDATE etl_runs SET status = 'failed', completed_at = NOW() WHERE run_uuid = %s", (run_uuid,))
     conn.commit()
 
 
 def _build_pig_env():
-    """Build environment dict with JAVA_HOME, PIG_HOME, HADOOP_HOME for subprocess."""
     env = os.environ.copy()
-    # Ensure JAVA_HOME is set
     if "JAVA_HOME" not in env:
-        for java_path in [
-            "/usr/lib/jvm/java-8-openjdk-amd64",
-            "/usr/lib/jvm/java-11-openjdk-amd64",
-        ]:
+        for java_path in ["/usr/lib/jvm/java-8-openjdk-amd64", "/usr/lib/jvm/java-11-openjdk-amd64"]:
             if os.path.isdir(java_path):
                 env["JAVA_HOME"] = java_path
                 break
-    # Ensure PIG_HOME is set
     if "PIG_HOME" not in env:
         home_pig = os.path.join(os.path.expanduser("~"), "pig")
         if os.path.isdir(home_pig):
             env["PIG_HOME"] = home_pig
-    # Ensure HADOOP_HOME is set (Pig may use Hadoop jars)
     if "HADOOP_HOME" not in env:
         home_hadoop = os.path.join(os.path.expanduser("~"), "hadoop")
         if os.path.isdir(home_hadoop):
@@ -348,13 +245,15 @@ def _build_pig_env():
     return env
 
 
-def run_pig(pig_bin, input_path, output_dir):
+def run_pig(pig_bin, input_path, output_dir, batch_mode, batch_value):
     cmd = [
         pig_bin,
         "-x", "local",
         "-param", f"INPUT={input_path}",
         "-param", f"OUTPUT={output_dir}",
         "-param", f"UDF_PATH={UDF_PATH}",
+        "-param", f"BATCH_VALUE={batch_value}",
+        "-param", f"BATCH_BY_TIME={1 if batch_mode == 'time' else 0}",
         PIG_SCRIPT,
     ]
     return subprocess.run(cmd, capture_output=True, text=True, env=_build_pig_env())
@@ -373,55 +272,91 @@ def read_part_rows(directory):
                         yield row
 
 
-def count_malformed(output_dir):
-    return sum(1 for _ in read_part_rows(os.path.join(output_dir, "malformed")))
-
-
-def load_results(conn, run_uuid, batch_id, output_dir):
+def load_pig_metadata(conn, run_uuid, output_dir):
+    total_records = 0
+    total_batches = 0
+    malformed_count = 0
     with conn.cursor() as cur:
-        for row in read_part_rows(os.path.join(output_dir, "q1")):
+        for row in read_part_rows(os.path.join(output_dir, "batch_metadata")):
             if len(row) < 4:
                 continue
+            batch_id = int(row[0])
+            batch_size = int(row[1])
+            records_processed = int(row[2])
+            batch_malformed = int(row[3])
+            total_batches += 1
+            total_records += records_processed
+            malformed_count += batch_malformed
             cur.execute("""
-                INSERT INTO daily_traffic
-                    (pipeline, run_uuid, batch_id, log_date, status_code, request_count, total_bytes)
-                VALUES ('pig', %s, %s, %s, %s, %s, %s)
-            """, (run_uuid, batch_id, row[0], int(row[1]), int(row[2]), int(row[3])))
+                INSERT INTO batch_metadata
+                    (run_uuid, pipeline, batch_id, batch_size, records_processed, malformed_count)
+                VALUES (%s, 'pig', %s, %s, %s, %s)
+            """, (run_uuid, batch_id, batch_size, records_processed, batch_malformed))
+            if batch_malformed:
+                cur.execute("""
+                    INSERT INTO malformed_record_summary
+                        (run_uuid, pipeline, batch_id, malformed_count)
+                    VALUES (%s, 'pig', %s, %s)
+                """, (run_uuid, batch_id, batch_malformed))
 
-        for row in read_part_rows(os.path.join(output_dir, "q2")):
-            if len(row) < 4:
+        for row in read_part_rows(os.path.join(output_dir, "malformed_records")):
+            if len(row) < 3:
                 continue
             cur.execute("""
-                INSERT INTO top_resources
-                    (pipeline, run_uuid, batch_id, resource_path, request_count, total_bytes, distinct_host_count)
-                VALUES ('pig', %s, %s, %s, %s, %s, %s)
-            """, (run_uuid, batch_id, row[0], int(row[1]), int(row[2]), int(row[3])))
+                INSERT INTO malformed_records
+                    (run_uuid, pipeline, batch_id, raw_line, reason)
+                VALUES (%s, 'pig', %s, %s, %s)
+            """, (run_uuid, int(row[0]), row[1], row[2]))
+    conn.commit()
+    return total_records, total_batches, malformed_count
 
-        for row in read_part_rows(os.path.join(output_dir, "q3")):
-            if len(row) < 6:
-                continue
-            distinct_hosts = int(row[5]) if row[5] else 0
-            cur.execute("""
-                INSERT INTO hourly_errors
-                    (pipeline, run_uuid, batch_id, log_date, log_hour,
-                     error_request_count, total_request_count, error_rate, distinct_error_hosts)
-                VALUES ('pig', %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                run_uuid,
-                batch_id,
-                row[0],
-                int(row[1]),
-                int(row[2]),
-                int(row[3]),
-                float(row[4]),
-                distinct_hosts,
-            ))
+
+def load_results(conn, run_uuid, batch_id, output_dir, query="all"):
+    with conn.cursor() as cur:
+        if query in {"all", "q1"}:
+            for row in read_part_rows(os.path.join(output_dir, "q1")):
+                if len(row) >= 4:
+                    cur.execute("""
+                        INSERT INTO daily_traffic
+                            (pipeline, run_uuid, batch_id, log_date, status_code, request_count, total_bytes)
+                        VALUES ('pig', %s, %s, %s, %s, %s, %s)
+                    """, (run_uuid, batch_id, row[0], int(row[1]), int(row[2]), int(row[3])))
+
+        if query in {"all", "q2"}:
+            for row in read_part_rows(os.path.join(output_dir, "q2")):
+                if len(row) >= 4:
+                    cur.execute("""
+                        INSERT INTO top_resources
+                            (pipeline, run_uuid, batch_id, resource_path, request_count, total_bytes, distinct_host_count)
+                        VALUES ('pig', %s, %s, %s, %s, %s, %s)
+                    """, (run_uuid, batch_id, row[0], int(row[1]), int(row[2]), int(row[3])))
+
+        if query in {"all", "q3"}:
+            for row in read_part_rows(os.path.join(output_dir, "q3")):
+                if len(row) >= 6:
+                    cur.execute("""
+                        INSERT INTO hourly_errors
+                            (pipeline, run_uuid, batch_id, log_date, log_hour,
+                             error_request_count, total_request_count, error_rate, distinct_error_hosts)
+                        VALUES ('pig', %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        run_uuid,
+                        batch_id,
+                        row[0],
+                        int(row[1]),
+                        int(row[2]),
+                        int(row[3]),
+                        float(row[4]),
+                        int(row[5]) if row[5] else 0,
+                    ))
     conn.commit()
 
 
-def run_pipeline(log_file_paths, batch_mode, batch_value, run_uuid):
+def run_pipeline(log_file_paths, batch_mode, batch_value, run_uuid, query="all"):
     if batch_mode not in {"records", "time"}:
         raise ValueError("batch_mode must be records or time")
+    if query not in {"all", "q1", "q2", "q3"}:
+        raise ValueError("query must be one of all, q1, q2, q3")
     if batch_value <= 0:
         raise ValueError("batch_value must be greater than 0")
 
@@ -429,29 +364,25 @@ def run_pipeline(log_file_paths, batch_mode, batch_value, run_uuid):
     if not pig_bin:
         raise FileNotFoundError("Pig executable not found. Install Pig or set PIG_HOME/PIG_BIN.")
 
+    for log_path in log_file_paths:
+        if not os.path.isfile(log_path):
+            raise FileNotFoundError(f"Log file not found: {log_path}")
+
     start_time = time.time()
-    tmp_dir = tempfile.mkdtemp(prefix="pig_batches_")
     output_dir = tempfile.mkdtemp(prefix="pig_output_")
-    combined_path = os.path.join(tmp_dir, "all_input.log")
     conn = pg_connect()
 
     try:
         init_postgres(conn)
         start_run(conn, run_uuid, batch_mode, batch_value)
 
-        chunks, total_records = split_batches(
-            log_file_paths, batch_mode, batch_value, tmp_dir, combined_path
-        )
-        total_batches = len(chunks)
-
         print("Pig ETL started")
         print(f"Run UUID: {run_uuid}")
         print(f"Batch mode: {batch_mode}")
         print(f"Batch value: {batch_value}")
         print(f"Input files: {log_file_paths}")
-        print(f"Total non-empty batches: {total_batches}")
 
-        result = run_pig(pig_bin, combined_path, output_dir)
+        result = run_pig(pig_bin, ",".join(log_file_paths), output_dir, batch_mode, batch_value)
         if result.stdout.strip():
             print(result.stdout.strip())
         if result.returncode != 0:
@@ -459,9 +390,9 @@ def run_pipeline(log_file_paths, batch_mode, batch_value, run_uuid):
                 print(result.stderr.strip())
             raise RuntimeError(f"Pig failed with exit code {result.returncode}")
 
-        malformed_count = count_malformed(output_dir)
+        total_records, total_batches, malformed_count = load_pig_metadata(conn, run_uuid, output_dir)
         avg_batch_size = total_records / total_batches if total_batches else 0
-        load_results(conn, run_uuid, total_batches, output_dir)
+        load_results(conn, run_uuid, total_batches, output_dir, query)
         runtime_seconds = time.time() - start_time
         finish_run(
             conn,
@@ -489,12 +420,12 @@ def run_pipeline(log_file_paths, batch_mode, batch_value, run_uuid):
         raise
     finally:
         conn.close()
-        shutil.rmtree(tmp_dir, ignore_errors=True)
         shutil.rmtree(output_dir, ignore_errors=True)
 
 
 def main():
     args = sys.argv[1:]
+    query = "all"
     if len(args) == 2:
         log_file_paths = [args[0]]
         batch_mode = "records"
@@ -505,12 +436,13 @@ def main():
         batch_mode = args[1]
         batch_value = int(args[2])
         run_uuid = args[3]
+        query = args[4] if len(args) >= 5 else "all"
     else:
         print("Usage: python3 orchestrator.py <log_file_path_or_json_array> <batch_mode> <batch_value> <run_uuid>")
         print("Legacy: python3 orchestrator.py <log_file_path> <batch_size>")
         sys.exit(1)
 
-    run_pipeline(log_file_paths, batch_mode, batch_value, run_uuid)
+    run_pipeline(log_file_paths, batch_mode, batch_value, run_uuid, query)
 
 
 if __name__ == "__main__":

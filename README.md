@@ -152,10 +152,11 @@ In the UI:
    /home/gourav-anirudh/Desktop/Nosql_Final_Project/Multi-Pipeline-ETL-and-Reporting-Framework-for-Web-Server-Log-Analytics/access_log_Jul95
    /home/gourav-anirudh/Desktop/Nosql_Final_Project/Multi-Pipeline-ETL-and-Reporting-Framework-for-Web-Server-Log-Analytics/access_log_Aug95
    ```
-3. Choose batch mode: Records or Time window
-4. Set batch value (e.g., 10000 records or 60 minutes)
-5. Click **Run** — watch real-time logs in the Terminal tab
-6. Results appear in the **Results** tab when done
+3. Select a query (`All queries`, `Q1`, `Q2`, or `Q3`)
+4. Choose batch mode: Records or Time window
+5. Set batch value (e.g., 10000 records or 60 minutes)
+6. Click **Run** — watch real-time logs in the Terminal tab
+7. Results and batch metadata appear in the **Results** tab when done
 
 ### CLI Runs
 
@@ -200,4 +201,6 @@ backend/server.py (FastAPI :5050)
     └── pipelines/hive/hive_pipeline.py     → hive -f → PostgreSQL
 ```
 
-All pipelines write to the same PostgreSQL tables: `etl_runs`, `daily_traffic`, `top_resources`, `hourly_errors`.
+All pipelines write to the same PostgreSQL tables: `etl_runs`, `batch_metadata`,
+`malformed_record_summary`, `malformed_records`, `daily_traffic`, `top_resources`,
+and `hourly_errors`.

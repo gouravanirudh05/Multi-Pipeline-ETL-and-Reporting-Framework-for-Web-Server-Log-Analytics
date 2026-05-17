@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import calendar
 import re
 
 # ------------------------------------------------------------------ #
@@ -24,7 +25,7 @@ MONTH_MAP = {
 }
 
 
-@outputSchema('parsed:tuple(host:chararray, log_date:chararray, log_hour:int, '
+@outputSchema('parsed:tuple(host:chararray, timestamp_epoch:long, log_date:chararray, log_hour:int, '
               'method:chararray, resource_path:chararray, '
               'protocol:chararray, status_code:int, bytes_transferred:long)')
 def parse_log_line(line):
@@ -62,19 +63,30 @@ def parse_log_line(line):
             return None
 
         # Parse date portion: "01/Jul/1995:00:00:01"
-        date_part   = timestamp.split(' ')[0]          # "01/Jul/1995:00:00:01"
+        parts = timestamp.split(' ')
+        date_part   = parts[0]          # "01/Jul/1995:00:00:01"
         day, month, rest = date_part.split('/')        # "01", "Jul", "1995:00:00:01"
-        year, hour  = rest.split(':')[0], rest.split(':')[1]
+        time_parts = rest.split(':')
+        year, hour = time_parts[0], time_parts[1]
+        minute, second = time_parts[2], time_parts[3]
 
         if month not in MONTH_MAP:
             return None
 
         log_date = '{}-{}-{}'.format(year, MONTH_MAP[month], day)
         log_hour = int(hour)
+        timestamp_epoch = calendar.timegm((
+            int(year), int(MONTH_MAP[month]), int(day),
+            int(hour), int(minute), int(second), 0, 0, 0
+        ))
+        if len(parts) > 1 and re.match(r'^[+-]\d{4}$', parts[1]):
+            sign = parts[1][0]
+            offset_minutes = int(parts[1][1:3]) * 60 + int(parts[1][3:5])
+            timestamp_epoch += offset_minutes * 60 if sign == '-' else -offset_minutes * 60
 
         bytes_transferred = 0 if raw_bytes == '-' else int(raw_bytes)
 
-        return (host, log_date, log_hour, method, resource,
+        return (host, long(timestamp_epoch), log_date, log_hour, method, resource,
                 protocol, status_code, bytes_transferred)
 
     except Exception:

@@ -77,6 +77,17 @@ public class NasaLogMapReduce extends Configured implements Tool {
         long epochSeconds;
     }
 
+    static final class BatchStat {
+        final long batchId;
+        long recordsProcessed;
+        long malformedCount;
+        final List<String> malformedLines = new ArrayList<String>();
+
+        BatchStat(long batchId) {
+            this.batchId = batchId;
+        }
+    }
+
     static ParsedLog parseLogLine(String line) {
         if (line == null || line.trim().isEmpty()) {
             return null;
@@ -386,6 +397,7 @@ public class NasaLogMapReduce extends Configured implements Tool {
         String batchMode = args[1];
         int batchValue = Integer.parseInt(args[2]);
         String runUuid = args[3];
+        String query = args.length >= 5 ? args[4] : "all";
 
         getConf().set("mapreduce.framework.name", "local");
         getConf().set("fs.defaultFS", "file:///");
@@ -395,6 +407,9 @@ public class NasaLogMapReduce extends Configured implements Tool {
         }
         if (batchValue <= 0) {
             throw new IllegalArgumentException("batch_value must be greater than 0");
+        }
+        if (!"all".equals(query) && !"q1".equals(query) && !"q2".equals(query) && !"q3".equals(query)) {
+            throw new IllegalArgumentException("query must be one of all, q1, q2, q3");
         }
 
         long startMillis = System.currentTimeMillis();
@@ -428,49 +443,50 @@ public class NasaLogMapReduce extends Configured implements Tool {
         long malformedRecords = metadataJob.getCounters()
             .findCounter(PipelineCounter.MALFORMED_LINES)
             .getValue();
-        long minEpoch = validRecords > 0 ? readMinEpoch(metadataOutput) : 0L;
-        long totalBatches = calculateTotalBatches(
-            batchMode,
-            batchValue,
-            totalRecords,
-            validRecords,
-            minEpoch,
-            inputPaths,
-            new Path(baseOutput, "time_windows")
-        );
+        List<BatchStat> batchStats = computeBatchStats(batchMode, batchValue, inputPaths);
+        long totalBatches = batchStats.size();
 
-        Path q1Output = new Path(baseOutput, "q1_daily_traffic");
-        Job q1Job = createJob("nasa-q1-daily-traffic", DailyTrafficMapper.class, DailyTrafficReducer.class, q1Output);
-        q1Job.setMapOutputKeyClass(Text.class);
-        q1Job.setMapOutputValueClass(Text.class);
-        q1Job.setOutputKeyClass(Text.class);
-        q1Job.setOutputValueClass(Text.class);
-        addInputs(q1Job, inputPaths);
-        if (!q1Job.waitForCompletion(true)) {
-            throw new IllegalStateException("Q1 MapReduce job failed");
+        Path q1Output = null;
+        if ("all".equals(query) || "q1".equals(query)) {
+            q1Output = new Path(baseOutput, "q1_daily_traffic");
+            Job q1Job = createJob("nasa-q1-daily-traffic", DailyTrafficMapper.class, DailyTrafficReducer.class, q1Output);
+            q1Job.setMapOutputKeyClass(Text.class);
+            q1Job.setMapOutputValueClass(Text.class);
+            q1Job.setOutputKeyClass(Text.class);
+            q1Job.setOutputValueClass(Text.class);
+            addInputs(q1Job, inputPaths);
+            if (!q1Job.waitForCompletion(true)) {
+                throw new IllegalStateException("Q1 MapReduce job failed");
+            }
         }
 
-        Path q2Output = new Path(baseOutput, "q2_top_resources");
-        Job q2Job = createJob("nasa-q2-top-resources", TopResourcesMapper.class, TopResourcesReducer.class, q2Output);
-        q2Job.setMapOutputKeyClass(Text.class);
-        q2Job.setMapOutputValueClass(Text.class);
-        q2Job.setOutputKeyClass(Text.class);
-        q2Job.setOutputValueClass(Text.class);
-        q2Job.setNumReduceTasks(1);
-        addInputs(q2Job, inputPaths);
-        if (!q2Job.waitForCompletion(true)) {
-            throw new IllegalStateException("Q2 MapReduce job failed");
+        Path q2Output = null;
+        if ("all".equals(query) || "q2".equals(query)) {
+            q2Output = new Path(baseOutput, "q2_top_resources");
+            Job q2Job = createJob("nasa-q2-top-resources", TopResourcesMapper.class, TopResourcesReducer.class, q2Output);
+            q2Job.setMapOutputKeyClass(Text.class);
+            q2Job.setMapOutputValueClass(Text.class);
+            q2Job.setOutputKeyClass(Text.class);
+            q2Job.setOutputValueClass(Text.class);
+            q2Job.setNumReduceTasks(1);
+            addInputs(q2Job, inputPaths);
+            if (!q2Job.waitForCompletion(true)) {
+                throw new IllegalStateException("Q2 MapReduce job failed");
+            }
         }
 
-        Path q3Output = new Path(baseOutput, "q3_hourly_errors");
-        Job q3Job = createJob("nasa-q3-hourly-errors", HourlyErrorsMapper.class, HourlyErrorsReducer.class, q3Output);
-        q3Job.setMapOutputKeyClass(Text.class);
-        q3Job.setMapOutputValueClass(Text.class);
-        q3Job.setOutputKeyClass(Text.class);
-        q3Job.setOutputValueClass(Text.class);
-        addInputs(q3Job, inputPaths);
-        if (!q3Job.waitForCompletion(true)) {
-            throw new IllegalStateException("Q3 MapReduce job failed");
+        Path q3Output = null;
+        if ("all".equals(query) || "q3".equals(query)) {
+            q3Output = new Path(baseOutput, "q3_hourly_errors");
+            Job q3Job = createJob("nasa-q3-hourly-errors", HourlyErrorsMapper.class, HourlyErrorsReducer.class, q3Output);
+            q3Job.setMapOutputKeyClass(Text.class);
+            q3Job.setMapOutputValueClass(Text.class);
+            q3Job.setOutputKeyClass(Text.class);
+            q3Job.setOutputValueClass(Text.class);
+            addInputs(q3Job, inputPaths);
+            if (!q3Job.waitForCompletion(true)) {
+                throw new IllegalStateException("Q3 MapReduce job failed");
+            }
         }
 
         double runtimeSeconds = (System.currentTimeMillis() - startMillis) / 1000.0;
@@ -487,6 +503,7 @@ public class NasaLogMapReduce extends Configured implements Tool {
             avgBatchSize,
             malformedRecords,
             runtimeSeconds,
+            batchStats,
             q1Output,
             q2Output,
             q3Output
@@ -561,7 +578,8 @@ public class NasaLogMapReduce extends Configured implements Tool {
 
     private void loadPostgres(String runUuid, String batchMode, int batchValue,
             long totalRecords, long totalBatches, double avgBatchSize, long malformedRecords,
-            double runtimeSeconds, Path q1Output, Path q2Output, Path q3Output) throws Exception {
+            double runtimeSeconds, List<BatchStat> batchStats,
+            Path q1Output, Path q2Output, Path q3Output) throws Exception {
         StringBuilder sql = new StringBuilder();
         sql.append(schemaSql());
         sql.append("INSERT INTO etl_runs ")
@@ -581,10 +599,20 @@ public class NasaLogMapReduce extends Configured implements Tool {
         sql.append("DELETE FROM daily_traffic WHERE run_uuid = ").append(sqlString(runUuid)).append(";\n");
         sql.append("DELETE FROM top_resources WHERE run_uuid = ").append(sqlString(runUuid)).append(";\n");
         sql.append("DELETE FROM hourly_errors WHERE run_uuid = ").append(sqlString(runUuid)).append(";\n");
+        sql.append("DELETE FROM batch_metadata WHERE run_uuid = ").append(sqlString(runUuid)).append(";\n");
+        sql.append("DELETE FROM malformed_record_summary WHERE run_uuid = ").append(sqlString(runUuid)).append(";\n");
+        sql.append("DELETE FROM malformed_records WHERE run_uuid = ").append(sqlString(runUuid)).append(";\n");
 
-        appendQ1Inserts(sql, runUuid, totalBatches, q1Output);
-        appendQ2Inserts(sql, runUuid, totalBatches, q2Output);
-        appendQ3Inserts(sql, runUuid, totalBatches, q3Output);
+        appendBatchMetadata(sql, runUuid, batchValue, batchStats, malformedRecords);
+        if (q1Output != null) {
+            appendQ1Inserts(sql, runUuid, totalBatches, q1Output);
+        }
+        if (q2Output != null) {
+            appendQ2Inserts(sql, runUuid, totalBatches, q2Output);
+        }
+        if (q3Output != null) {
+            appendQ3Inserts(sql, runUuid, totalBatches, q3Output);
+        }
 
         sql.append("UPDATE etl_runs SET ")
             .append("total_records = ").append(totalRecords).append(", ")
@@ -600,6 +628,97 @@ public class NasaLogMapReduce extends Configured implements Tool {
             .append(" WHERE run_uuid = ").append(sqlString(runUuid)).append(";\n");
 
         runPsql(sql.toString());
+    }
+
+    private void appendBatchMetadata(StringBuilder sql, String runUuid, int batchValue,
+            List<BatchStat> batchStats, long malformedRecords) {
+        for (BatchStat stat : batchStats) {
+            sql.append("INSERT INTO batch_metadata ")
+                .append("(run_uuid, pipeline, batch_id, batch_size, records_processed, malformed_count) VALUES (")
+                .append(sqlString(runUuid)).append(", 'mapreduce', ")
+                .append(stat.batchId).append(", ")
+                .append(batchValue).append(", ")
+                .append(stat.recordsProcessed).append(", ")
+                .append(stat.malformedCount).append(");\n");
+            if (stat.malformedCount > 0) {
+                sql.append("INSERT INTO malformed_record_summary ")
+                    .append("(run_uuid, pipeline, batch_id, malformed_count) VALUES (")
+                    .append(sqlString(runUuid)).append(", 'mapreduce', ")
+                    .append(stat.batchId).append(", ")
+                    .append(stat.malformedCount).append(");\n");
+            }
+            for (String rawLine : stat.malformedLines) {
+                sql.append("INSERT INTO malformed_records ")
+                    .append("(run_uuid, pipeline, batch_id, raw_line, reason) VALUES (")
+                    .append(sqlString(runUuid)).append(", 'mapreduce', ")
+                    .append(stat.batchId).append(", ")
+                    .append(sqlString(rawLine)).append(", 'parse_failed');\n");
+            }
+        }
+        if (malformedRecords > 0 && batchStats.isEmpty()) {
+            sql.append("INSERT INTO malformed_record_summary ")
+                .append("(run_uuid, pipeline, batch_id, malformed_count) VALUES (")
+                .append(sqlString(runUuid)).append(", 'mapreduce', 0, ")
+                .append(malformedRecords).append(");\n");
+        }
+    }
+
+    private List<BatchStat> computeBatchStats(String batchMode, int batchValue, List<String> inputPaths)
+            throws IOException {
+        List<BatchStat> stats = new ArrayList<BatchStat>();
+        Map<Long, BatchStat> byTimeWindow = new HashMap<Long, BatchStat>();
+        long totalSeen = 0L;
+        Long firstEpoch = null;
+        Long activeWindow = null;
+
+        for (String inputPath : inputPaths) {
+            BufferedReader reader = Files.newBufferedReader(
+                java.nio.file.Paths.get(inputPath),
+                StandardCharsets.UTF_8
+            );
+            try {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    totalSeen++;
+                    ParsedLog parsed = parseLogLine(line);
+                    long batchId;
+                    if ("records".equals(batchMode)) {
+                        batchId = ((totalSeen - 1L) / (long) batchValue) + 1L;
+                        while (stats.size() < batchId) {
+                            stats.add(new BatchStat(stats.size() + 1L));
+                        }
+                    } else {
+                        long window;
+                        if (parsed != null) {
+                            if (firstEpoch == null) {
+                                firstEpoch = parsed.epochSeconds;
+                            }
+                            window = Math.floorDiv(parsed.epochSeconds - firstEpoch.longValue(), (long) batchValue);
+                            activeWindow = window;
+                        } else {
+                            window = activeWindow == null ? 0L : activeWindow.longValue();
+                        }
+                        BatchStat existing = byTimeWindow.get(window);
+                        if (existing == null) {
+                            existing = new BatchStat(byTimeWindow.size() + 1L);
+                            byTimeWindow.put(window, existing);
+                            stats.add(existing);
+                        }
+                        batchId = existing.batchId;
+                    }
+
+                    BatchStat stat = stats.get((int) batchId - 1);
+                    stat.recordsProcessed++;
+                    if (parsed == null) {
+                        stat.malformedCount++;
+                        stat.malformedLines.add(line);
+                    }
+                }
+            } finally {
+                reader.close();
+            }
+        }
+        return stats;
     }
 
     private void appendQ1Inserts(StringBuilder sql, String runUuid, long batchId, Path outputPath)
@@ -714,6 +833,19 @@ public class NasaLogMapReduce extends Configured implements Tool {
             + ");\n"
             + "ALTER TABLE etl_runs ADD COLUMN IF NOT EXISTS batch_mode VARCHAR(20) DEFAULT 'records';\n"
             + "ALTER TABLE etl_runs ADD COLUMN IF NOT EXISTS batch_interval_seconds INTEGER;\n"
+            + "CREATE TABLE IF NOT EXISTS batch_metadata ("
+            + "id SERIAL PRIMARY KEY, run_uuid VARCHAR(64), pipeline VARCHAR(20), batch_id INTEGER, "
+            + "batch_size INTEGER, records_processed INTEGER, malformed_count INTEGER DEFAULT 0, "
+            + "started_at TIMESTAMPTZ DEFAULT NOW(), completed_at TIMESTAMPTZ DEFAULT NOW()"
+            + ");\n"
+            + "CREATE TABLE IF NOT EXISTS malformed_record_summary ("
+            + "id SERIAL PRIMARY KEY, run_uuid VARCHAR(64), pipeline VARCHAR(20), batch_id INTEGER, "
+            + "malformed_count INTEGER, recorded_at TIMESTAMPTZ DEFAULT NOW()"
+            + ");\n"
+            + "CREATE TABLE IF NOT EXISTS malformed_records ("
+            + "id SERIAL PRIMARY KEY, run_uuid VARCHAR(64), pipeline VARCHAR(20), batch_id INTEGER, "
+            + "raw_line TEXT, reason TEXT, recorded_at TIMESTAMPTZ DEFAULT NOW()"
+            + ");\n"
             + "CREATE TABLE IF NOT EXISTS daily_traffic ("
             + "id SERIAL PRIMARY KEY, pipeline VARCHAR(20), run_uuid VARCHAR(64), batch_id INTEGER, "
             + "executed_at TIMESTAMPTZ DEFAULT NOW(), log_date DATE, status_code INTEGER, "
@@ -729,7 +861,13 @@ public class NasaLogMapReduce extends Configured implements Tool {
             + "executed_at TIMESTAMPTZ DEFAULT NOW(), log_date DATE, log_hour SMALLINT, "
             + "error_request_count BIGINT, total_request_count BIGINT, error_rate NUMERIC(6,4), "
             + "distinct_error_hosts BIGINT"
-            + ");\n";
+            + ");\n"
+            + "CREATE INDEX IF NOT EXISTS idx_batch_run ON batch_metadata(run_uuid, batch_id);\n"
+            + "CREATE INDEX IF NOT EXISTS idx_malformed_summary_run ON malformed_record_summary(run_uuid, batch_id);\n"
+            + "CREATE INDEX IF NOT EXISTS idx_malformed_records_run ON malformed_records(run_uuid, batch_id);\n"
+            + "CREATE INDEX IF NOT EXISTS idx_daily_pipeline_date ON daily_traffic(pipeline, log_date);\n"
+            + "CREATE INDEX IF NOT EXISTS idx_resource_pipeline ON top_resources(pipeline, request_count DESC);\n"
+            + "CREATE INDEX IF NOT EXISTS idx_error_pipeline_date ON hourly_errors(pipeline, log_date, log_hour);\n";
     }
 
     private void runPsql(String sql) throws Exception {

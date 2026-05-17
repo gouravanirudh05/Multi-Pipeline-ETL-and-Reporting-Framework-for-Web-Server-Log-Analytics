@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import csv
 import json
-import math
 import os
 import re
 import shutil
@@ -9,7 +8,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
 
 import psycopg2
 
@@ -21,28 +19,6 @@ PG_CONFIG = {
     "user": os.environ.get("PGUSER", "sathish"),
     "password": os.environ.get("PGPASSWORD", "welcome"),
 }
-
-LOG_PATTERN = re.compile(
-    r'^(\S+) \S+ \S+ \[(.*?)\] "(\S+) (.*?) (\S+)" (\d{3}) (\S+)'
-)
-TS_PATTERN = re.compile(
-    r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2})(?:\s+([+-])(\d{2})(\d{2}))?$'
-)
-MONTH_MAP = {
-    "Jan": 1,
-    "Feb": 2,
-    "Mar": 3,
-    "Apr": 4,
-    "May": 5,
-    "Jun": 6,
-    "Jul": 7,
-    "Aug": 8,
-    "Sep": 9,
-    "Oct": 10,
-    "Nov": 11,
-    "Dec": 12,
-}
-
 
 def find_hive_bin():
     explicit = os.environ.get("HIVE_BIN")
@@ -77,76 +53,6 @@ def parse_path_list(raw):
     return [raw]
 
 
-def parse_log_epoch(line):
-    match = LOG_PATTERN.match(line.strip())
-    if not match:
-        return None
-
-    ts_match = TS_PATTERN.match(match.group(2))
-    if not ts_match:
-        return None
-
-    try:
-        day = int(ts_match.group(1))
-        month = MONTH_MAP.get(ts_match.group(2))
-        if month is None:
-            return None
-        year = int(ts_match.group(3))
-        hour = int(ts_match.group(4))
-        minute = int(ts_match.group(5))
-        second = int(ts_match.group(6))
-        offset = timezone.utc
-        if ts_match.group(7):
-            offset_text = f"{ts_match.group(7)}{ts_match.group(8)}{ts_match.group(9)}"
-            offset = datetime.strptime(offset_text, "%z").tzinfo
-        return int(datetime(year, month, day, hour, minute, second, tzinfo=offset).timestamp())
-    except Exception:
-        return None
-
-
-def copy_inputs_and_count_batches(log_file_paths, batch_mode, batch_value, combined_path):
-    total_records = 0
-    total_batches = 0
-    records_in_batch = 0
-    first_epoch = None
-    active_window = None
-
-    with open(combined_path, "w", encoding="utf-8") as combined:
-        for log_path in log_file_paths:
-            if not os.path.isfile(log_path):
-                raise FileNotFoundError(f"Log file not found: {log_path}")
-
-            with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    total_records += 1
-                    combined.write(line)
-
-                    if batch_mode == "records":
-                        if records_in_batch == 0:
-                            total_batches += 1
-                        records_in_batch += 1
-                        if records_in_batch >= batch_value:
-                            records_in_batch = 0
-                        continue
-
-                    epoch = parse_log_epoch(line)
-                    if epoch is not None:
-                        if first_epoch is None:
-                            first_epoch = epoch
-                        window = math.floor((epoch - first_epoch) / batch_value)
-                    else:
-                        window = active_window if active_window is not None else 0
-
-                    if active_window is None:
-                        active_window = window
-                        total_batches += 1
-                    elif window != active_window:
-                        active_window = window
-                        total_batches += 1
-
-    return total_records, total_batches
-
-
 def hql_string(value):
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
@@ -156,15 +62,45 @@ def safe_database_name(run_uuid):
     return f"nasa_etl_{cleaned}"[:120]
 
 
-def build_hql(run_uuid, combined_path, output_dir):
+def build_hql(run_uuid, log_file_paths, batch_mode, batch_value, output_dir):
     database = safe_database_name(run_uuid)
     q1_dir = os.path.join(output_dir, "q1")
     q2_dir = os.path.join(output_dir, "q2")
     q3_dir = os.path.join(output_dir, "q3")
-    malformed_dir = os.path.join(output_dir, "malformed")
+    batch_dir = os.path.join(output_dir, "batch_metadata")
+    malformed_summary_dir = os.path.join(output_dir, "malformed_summary")
+    malformed_records_dir = os.path.join(output_dir, "malformed_records")
 
     log_regex = r'^(\S+) \S+ \S+ \[(.*?)\] "(\S+) (.*?) (\S+)" (\d{3}) (\S+)'
     ts_regex = r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2})(?:\s+([+-])(\d{2})(\d{2}))?$'
+    load_statements = "\n".join(
+        f"LOAD DATA LOCAL INPATH {hql_string(path)} INTO TABLE raw_logs;"
+        for path in log_file_paths
+    )
+    valid_condition = """
+  host <> ''
+  AND method <> ''
+  AND resource_path <> ''
+  AND protocol <> ''
+  AND month_num IS NOT NULL
+  AND day_text <> ''
+  AND year_text <> ''
+  AND hour_text <> ''
+  AND minute_text <> ''
+  AND second_text <> ''
+  AND status_text RLIKE '^\\\\d{3}$'
+  AND (bytes_text = '-' OR bytes_text RLIKE '^\\\\d+$')
+"""
+    epoch_expr = "unix_timestamp(concat(year_text, '-', month_num, '-', day_text, ' ', hour_text, ':', minute_text, ':', second_text), 'yyyy-MM-dd HH:mm:ss')"
+    if batch_mode == "time":
+        batch_expr = f"""
+  CASE
+    WHEN is_valid = 1 THEN (floor(cast(({epoch_expr} - min_epoch) AS double) / cast({batch_value} AS double)) + 1)
+    ELSE 1
+  END
+"""
+    else:
+        batch_expr = f"(floor(cast((record_number - 1) AS double) / cast({batch_value} AS double)) + 1)"
 
     return f"""
 SET hive.exec.mode.local.auto=true;
@@ -176,10 +112,17 @@ CREATE DATABASE {database};
 USE {database};
 
 CREATE TABLE raw_logs(line STRING);
-LOAD DATA LOCAL INPATH {hql_string(combined_path)} OVERWRITE INTO TABLE raw_logs;
+{load_statements}
+
+CREATE TABLE raw_indexed AS
+SELECT
+  row_number() OVER (ORDER BY line) AS record_number,
+  line
+FROM raw_logs;
 
 CREATE TABLE extracted AS
 SELECT
+  record_number,
   line,
   regexp_extract(line, {hql_string(log_regex)}, 1) AS host,
   regexp_extract(line, {hql_string(log_regex)}, 2) AS timestamp_text,
@@ -188,10 +131,11 @@ SELECT
   regexp_extract(line, {hql_string(log_regex)}, 5) AS protocol,
   regexp_extract(line, {hql_string(log_regex)}, 6) AS status_text,
   regexp_extract(line, {hql_string(log_regex)}, 7) AS bytes_text
-FROM raw_logs;
+FROM raw_indexed;
 
 CREATE TABLE parsed AS
 SELECT
+  record_number,
   line,
   host,
   timestamp_text,
@@ -228,8 +172,28 @@ SELECT
   END AS month_num
 FROM parsed;
 
+CREATE TABLE normalized_validated AS
+SELECT
+  *,
+  CASE WHEN {valid_condition} THEN 1 ELSE 0 END AS is_valid
+FROM normalized;
+
+CREATE TABLE valid_epoch AS
+SELECT
+  min({epoch_expr}) AS min_epoch
+FROM normalized_validated
+WHERE is_valid = 1;
+
+CREATE TABLE annotated_logs AS
+SELECT
+  n.*,
+  {batch_expr} AS batch_id
+FROM normalized_validated n
+CROSS JOIN valid_epoch;
+
 CREATE TABLE valid_logs AS
 SELECT
+  batch_id,
   host,
   concat(year_text, '-', month_num, '-', day_text) AS log_date,
   cast(hour_text AS int) AS log_hour,
@@ -238,20 +202,32 @@ SELECT
   protocol,
   cast(status_text AS int) AS status_code,
   CASE WHEN bytes_text = '-' THEN 0 ELSE cast(bytes_text AS bigint) END AS bytes_transferred,
-  unix_timestamp(concat(year_text, '-', month_num, '-', day_text, ' ', hour_text, ':', minute_text, ':', second_text), 'yyyy-MM-dd HH:mm:ss') AS epoch_seconds
-FROM normalized
-WHERE host <> ''
-  AND method <> ''
-  AND resource_path <> ''
-  AND protocol <> ''
-  AND month_num IS NOT NULL
-  AND day_text <> ''
-  AND year_text <> ''
-  AND hour_text <> ''
-  AND minute_text <> ''
-  AND second_text <> ''
-  AND status_text RLIKE '^\\\\d{{3}}$'
-  AND (bytes_text = '-' OR bytes_text RLIKE '^\\\\d+$');
+  {epoch_expr} AS epoch_seconds
+FROM annotated_logs
+WHERE is_valid = 1;
+
+INSERT OVERWRITE LOCAL DIRECTORY {hql_string(batch_dir)}
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '\\t'
+SELECT
+  batch_id,
+  {batch_value} AS batch_size,
+  count(1) AS records_processed,
+  sum(CASE WHEN is_valid = 1 THEN 0 ELSE 1 END) AS malformed_count
+FROM annotated_logs
+GROUP BY batch_id;
+
+INSERT OVERWRITE LOCAL DIRECTORY {hql_string(malformed_summary_dir)}
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '\\t'
+SELECT batch_id, count(1)
+FROM annotated_logs
+WHERE is_valid = 0
+GROUP BY batch_id;
+
+INSERT OVERWRITE LOCAL DIRECTORY {hql_string(malformed_records_dir)}
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '\\t'
+SELECT batch_id, line, 'parse_failed'
+FROM annotated_logs
+WHERE is_valid = 0;
 
 INSERT OVERWRITE LOCAL DIRECTORY {hql_string(q1_dir)}
 ROW FORMAT DELIMITED FIELDS TERMINATED BY '\\t'
@@ -278,25 +254,6 @@ SELECT
   count(DISTINCT CASE WHEN status_code >= 400 AND status_code <= 599 THEN host ELSE NULL END) AS distinct_error_hosts
 FROM valid_logs
 GROUP BY log_date, log_hour;
-
-INSERT OVERWRITE LOCAL DIRECTORY {hql_string(malformed_dir)}
-ROW FORMAT DELIMITED FIELDS TERMINATED BY '\\t'
-SELECT line
-FROM normalized
-WHERE NOT (
-  host <> ''
-  AND method <> ''
-  AND resource_path <> ''
-  AND protocol <> ''
-  AND month_num IS NOT NULL
-  AND day_text <> ''
-  AND year_text <> ''
-  AND hour_text <> ''
-  AND minute_text <> ''
-  AND second_text <> ''
-  AND status_text RLIKE '^\\\\d{{3}}$'
-  AND (bytes_text = '-' OR bytes_text RLIKE '^\\\\d+$')
-);
 
 DROP DATABASE IF EXISTS {database} CASCADE;
 """
@@ -325,6 +282,40 @@ def init_postgres(conn):
         """)
         cur.execute("ALTER TABLE etl_runs ADD COLUMN IF NOT EXISTS batch_mode VARCHAR(20) DEFAULT 'records'")
         cur.execute("ALTER TABLE etl_runs ADD COLUMN IF NOT EXISTS batch_interval_seconds INTEGER")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS batch_metadata (
+                id SERIAL PRIMARY KEY,
+                run_uuid VARCHAR(64),
+                pipeline VARCHAR(20),
+                batch_id INTEGER,
+                batch_size INTEGER,
+                records_processed INTEGER,
+                malformed_count INTEGER DEFAULT 0,
+                started_at TIMESTAMPTZ DEFAULT NOW(),
+                completed_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS malformed_record_summary (
+                id SERIAL PRIMARY KEY,
+                run_uuid VARCHAR(64),
+                pipeline VARCHAR(20),
+                batch_id INTEGER,
+                malformed_count INTEGER,
+                recorded_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS malformed_records (
+                id SERIAL PRIMARY KEY,
+                run_uuid VARCHAR(64),
+                pipeline VARCHAR(20),
+                batch_id INTEGER,
+                raw_line TEXT,
+                reason TEXT,
+                recorded_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS daily_traffic (
                 id SERIAL PRIMARY KEY,
@@ -366,6 +357,12 @@ def init_postgres(conn):
                 distinct_error_hosts BIGINT
             )
         """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_batch_run ON batch_metadata(run_uuid, batch_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_malformed_summary_run ON malformed_record_summary(run_uuid, batch_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_malformed_records_run ON malformed_records(run_uuid, batch_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_daily_pipeline_date ON daily_traffic(pipeline, log_date)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_resource_pipeline ON top_resources(pipeline, request_count DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_error_pipeline_date ON hourly_errors(pipeline, log_date, log_hour)")
     conn.commit()
 
 
@@ -390,6 +387,9 @@ def start_run(conn, run_uuid, batch_mode, batch_value):
         cur.execute("DELETE FROM daily_traffic WHERE run_uuid = %s", (run_uuid,))
         cur.execute("DELETE FROM top_resources WHERE run_uuid = %s", (run_uuid,))
         cur.execute("DELETE FROM hourly_errors WHERE run_uuid = %s", (run_uuid,))
+        cur.execute("DELETE FROM batch_metadata WHERE run_uuid = %s", (run_uuid,))
+        cur.execute("DELETE FROM malformed_record_summary WHERE run_uuid = %s", (run_uuid,))
+        cur.execute("DELETE FROM malformed_records WHERE run_uuid = %s", (run_uuid,))
     conn.commit()
 
 
@@ -443,54 +443,92 @@ def read_output_rows(directory):
                     yield row
 
 
-def count_malformed(output_dir):
-    return sum(1 for _ in read_output_rows(os.path.join(output_dir, "malformed")))
-
-
-def load_results(conn, run_uuid, batch_id, output_dir):
+def load_hive_metadata(conn, run_uuid, output_dir):
+    total_records = 0
+    total_batches = 0
+    malformed_count = 0
     with conn.cursor() as cur:
-        for row in read_output_rows(os.path.join(output_dir, "q1")):
+        for row in read_output_rows(os.path.join(output_dir, "batch_metadata")):
             if len(row) < 4:
                 continue
+            batch_id = int(float(row[0]))
+            batch_size = int(row[1])
+            records_processed = int(row[2])
+            batch_malformed = int(row[3])
+            total_batches += 1
+            total_records += records_processed
+            malformed_count += batch_malformed
             cur.execute("""
-                INSERT INTO daily_traffic
-                    (pipeline, run_uuid, batch_id, log_date, status_code, request_count, total_bytes)
-                VALUES ('hive', %s, %s, %s, %s, %s, %s)
-            """, (run_uuid, batch_id, row[0], int(row[1]), int(row[2]), int(row[3])))
-
-        for row in read_output_rows(os.path.join(output_dir, "q2")):
-            if len(row) < 4:
+                INSERT INTO batch_metadata
+                    (run_uuid, pipeline, batch_id, batch_size, records_processed, malformed_count)
+                VALUES (%s, 'hive', %s, %s, %s, %s)
+            """, (run_uuid, batch_id, batch_size, records_processed, batch_malformed))
+            if batch_malformed:
+                cur.execute("""
+                    INSERT INTO malformed_record_summary
+                        (run_uuid, pipeline, batch_id, malformed_count)
+                    VALUES (%s, 'hive', %s, %s)
+                """, (run_uuid, batch_id, batch_malformed))
+        for row in read_output_rows(os.path.join(output_dir, "malformed_records")):
+            if len(row) < 3:
                 continue
             cur.execute("""
-                INSERT INTO top_resources
-                    (pipeline, run_uuid, batch_id, resource_path, request_count, total_bytes, distinct_host_count)
-                VALUES ('hive', %s, %s, %s, %s, %s, %s)
-            """, (run_uuid, batch_id, row[0], int(row[1]), int(row[2]), int(row[3])))
+                INSERT INTO malformed_records
+                    (run_uuid, pipeline, batch_id, raw_line, reason)
+                VALUES (%s, 'hive', %s, %s, %s)
+            """, (run_uuid, int(float(row[0])), row[1], row[2]))
+    conn.commit()
+    return total_records, total_batches, malformed_count
 
-        for row in read_output_rows(os.path.join(output_dir, "q3")):
-            if len(row) < 6:
-                continue
-            cur.execute("""
-                INSERT INTO hourly_errors
-                    (pipeline, run_uuid, batch_id, log_date, log_hour,
-                     error_request_count, total_request_count, error_rate, distinct_error_hosts)
-                VALUES ('hive', %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                run_uuid,
-                batch_id,
-                row[0],
-                int(row[1]),
-                int(row[2]),
-                int(row[3]),
-                float(row[4]),
-                int(row[5]),
-            ))
+
+def load_results(conn, run_uuid, batch_id, output_dir, query="all"):
+    with conn.cursor() as cur:
+        if query in {"all", "q1"}:
+            for row in read_output_rows(os.path.join(output_dir, "q1")):
+                if len(row) < 4:
+                    continue
+                cur.execute("""
+                    INSERT INTO daily_traffic
+                        (pipeline, run_uuid, batch_id, log_date, status_code, request_count, total_bytes)
+                    VALUES ('hive', %s, %s, %s, %s, %s, %s)
+                """, (run_uuid, batch_id, row[0], int(row[1]), int(row[2]), int(row[3])))
+
+        if query in {"all", "q2"}:
+            for row in read_output_rows(os.path.join(output_dir, "q2")):
+                if len(row) < 4:
+                    continue
+                cur.execute("""
+                    INSERT INTO top_resources
+                        (pipeline, run_uuid, batch_id, resource_path, request_count, total_bytes, distinct_host_count)
+                    VALUES ('hive', %s, %s, %s, %s, %s, %s)
+                """, (run_uuid, batch_id, row[0], int(row[1]), int(row[2]), int(row[3])))
+
+        if query in {"all", "q3"}:
+            for row in read_output_rows(os.path.join(output_dir, "q3")):
+                if len(row) < 6:
+                    continue
+                cur.execute("""
+                    INSERT INTO hourly_errors
+                        (pipeline, run_uuid, batch_id, log_date, log_hour,
+                         error_request_count, total_request_count, error_rate, distinct_error_hosts)
+                    VALUES ('hive', %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    run_uuid,
+                    batch_id,
+                    row[0],
+                    int(row[1]),
+                    int(row[2]),
+                    int(row[3]),
+                    float(row[4]),
+                    int(row[5]),
+                ))
     conn.commit()
 
 
 def _build_hive_env():
     """Build environment dict with JAVA_HOME, HADOOP_HOME, HIVE_HOME for subprocess."""
     env = os.environ.copy()
+    env.pop("DEBUG", None)
     # Ensure JAVA_HOME is set
     if "JAVA_HOME" not in env:
         for java_path in [
@@ -611,9 +649,11 @@ def run_hive(hive_bin, hql_path):
     return result
 
 
-def run_pipeline(log_file_paths, batch_mode, batch_value, run_uuid):
+def run_pipeline(log_file_paths, batch_mode, batch_value, run_uuid, query="all"):
     if batch_mode not in {"records", "time"}:
         raise ValueError("batch_mode must be records or time")
+    if query not in {"all", "q1", "q2", "q3"}:
+        raise ValueError("query must be one of all, q1, q2, q3")
     if batch_value <= 0:
         raise ValueError("batch_value must be greater than 0")
 
@@ -625,27 +665,24 @@ def run_pipeline(log_file_paths, batch_mode, batch_value, run_uuid):
     work_dir = tempfile.mkdtemp(prefix="hive_etl_")
     output_dir = os.path.join(work_dir, "output")
     os.makedirs(output_dir, exist_ok=True)
-    combined_path = os.path.join(work_dir, "all_input.log")
     hql_path = os.path.join(work_dir, "pipeline.hql")
     conn = pg_connect()
 
     try:
         init_postgres(conn)
         start_run(conn, run_uuid, batch_mode, batch_value)
-
-        total_records, total_batches = copy_inputs_and_count_batches(
-            log_file_paths, batch_mode, batch_value, combined_path
-        )
+        for log_path in log_file_paths:
+            if not os.path.isfile(log_path):
+                raise FileNotFoundError(f"Log file not found: {log_path}")
 
         print("Hive ETL started")
         print(f"Run UUID: {run_uuid}")
         print(f"Batch mode: {batch_mode}")
         print(f"Batch value: {batch_value}")
         print(f"Input files: {log_file_paths}")
-        print(f"Total non-empty batches: {total_batches}")
 
         with open(hql_path, "w", encoding="utf-8") as fh:
-            fh.write(build_hql(run_uuid, combined_path, output_dir))
+            fh.write(build_hql(run_uuid, log_file_paths, batch_mode, batch_value, output_dir))
 
         result = run_hive(hive_bin, hql_path)
         if result.stdout.strip():
@@ -655,9 +692,9 @@ def run_pipeline(log_file_paths, batch_mode, batch_value, run_uuid):
                 print(result.stderr.strip())
             raise RuntimeError(f"Hive failed with exit code {result.returncode}")
 
-        malformed_count = count_malformed(output_dir)
+        total_records, total_batches, malformed_count = load_hive_metadata(conn, run_uuid, output_dir)
         avg_batch_size = total_records / total_batches if total_batches else 0
-        load_results(conn, run_uuid, total_batches, output_dir)
+        load_results(conn, run_uuid, total_batches, output_dir, query)
         runtime_seconds = time.time() - start_time
         finish_run(
             conn,
@@ -690,6 +727,7 @@ def run_pipeline(log_file_paths, batch_mode, batch_value, run_uuid):
 
 def main():
     args = sys.argv[1:]
+    query = "all"
     if len(args) == 2:
         log_file_paths = [args[0]]
         batch_mode = "records"
@@ -700,12 +738,13 @@ def main():
         batch_mode = args[1]
         batch_value = int(args[2])
         run_uuid = args[3]
+        query = args[4] if len(args) >= 5 else "all"
     else:
         print("Usage: python3 hive_pipeline.py <log_file_path_or_json_array> <batch_mode> <batch_value> <run_uuid>")
         print("Legacy: python3 hive_pipeline.py <log_file_path> <batch_size>")
         sys.exit(1)
 
-    run_pipeline(log_file_paths, batch_mode, batch_value, run_uuid)
+    run_pipeline(log_file_paths, batch_mode, batch_value, run_uuid, query)
 
 
 if __name__ == "__main__":

@@ -86,6 +86,40 @@ def initialize_postgres():
         ADD COLUMN IF NOT EXISTS batch_interval_seconds INTEGER
     """)
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS batch_metadata (
+            id SERIAL PRIMARY KEY,
+            run_uuid VARCHAR(64),
+            pipeline VARCHAR(20),
+            batch_id INTEGER,
+            batch_size INTEGER,
+            records_processed INTEGER,
+            malformed_count INTEGER DEFAULT 0,
+            started_at TIMESTAMPTZ DEFAULT NOW(),
+            completed_at TIMESTAMPTZ DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS malformed_record_summary (
+            id SERIAL PRIMARY KEY,
+            run_uuid VARCHAR(64),
+            pipeline VARCHAR(20),
+            batch_id INTEGER,
+            malformed_count INTEGER,
+            recorded_at TIMESTAMPTZ DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS malformed_records (
+            id SERIAL PRIMARY KEY,
+            run_uuid VARCHAR(64),
+            pipeline VARCHAR(20),
+            batch_id INTEGER,
+            raw_line TEXT,
+            reason TEXT,
+            recorded_at TIMESTAMPTZ DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS daily_traffic (
             id SERIAL PRIMARY KEY,
             pipeline VARCHAR(20),
@@ -126,6 +160,12 @@ def initialize_postgres():
             distinct_error_hosts BIGINT
         )
     """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_batch_run ON batch_metadata(run_uuid, batch_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_malformed_summary_run ON malformed_record_summary(run_uuid, batch_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_malformed_records_run ON malformed_records(run_uuid, batch_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_daily_pipeline_date ON daily_traffic(pipeline, log_date)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_resource_pipeline ON top_resources(pipeline, request_count DESC)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_error_pipeline_date ON hourly_errors(pipeline, log_date, log_hour)")
     conn.commit()
     cur.close()
     conn.close()
@@ -151,6 +191,7 @@ async def run_pipeline(req: Request):
     batch_mode = body.get("batch_mode", "records")
     batch_size = int(body.get("batch_size", 10000) or 10000)
     batch_interval_seconds = int(body.get("batch_interval_seconds", 3600) or 3600)
+    query = body.get("query", "all")
     log_files = body.get("log_files", [])
 
     if not pipeline or not log_files:
@@ -161,6 +202,8 @@ async def run_pipeline(req: Request):
         return {"error": "batch_size must be greater than 0"}
     if batch_interval_seconds <= 0:
         return {"error": "batch_interval_seconds must be greater than 0"}
+    if query not in {"all", "q1", "q2", "q3"}:
+        return {"error": "query must be one of: all, q1, q2, q3"}
 
     batch_value = batch_interval_seconds if batch_mode == "time" else batch_size
 
@@ -208,7 +251,8 @@ async def run_pipeline(req: Request):
             json.dumps(log_file_paths),
             batch_mode,
             str(batch_value),
-            run_uuid
+            run_uuid,
+            query
         ]
     elif pipeline == "pig":
         cmd = [
@@ -217,7 +261,8 @@ async def run_pipeline(req: Request):
             json.dumps(log_file_paths),
             batch_mode,
             str(batch_value),
-            run_uuid
+            run_uuid,
+            query
         ]
     elif pipeline == "mapreduce":
         cmd = [
@@ -226,7 +271,8 @@ async def run_pipeline(req: Request):
             json.dumps(log_file_paths),
             batch_mode,
             str(batch_value),
-            run_uuid
+            run_uuid,
+            query
         ]
     elif pipeline == "hive":
         cmd = [
@@ -235,7 +281,8 @@ async def run_pipeline(req: Request):
             json.dumps(log_file_paths),
             batch_mode,
             str(batch_value),
-            run_uuid
+            run_uuid,
+            query
         ]
     else:
         return {"error": f"Unknown pipeline: {pipeline}"}
@@ -361,6 +408,25 @@ def get_results(run_uuid: str):
         """, (run_uuid,))
         q3 = [dict(row) for row in cur.fetchall()]
 
+        cur.execute("""
+            SELECT batch_id, batch_size, records_processed, malformed_count,
+                   started_at, completed_at
+            FROM batch_metadata
+            WHERE run_uuid = %s
+            ORDER BY batch_id
+            LIMIT 100
+        """, (run_uuid,))
+        batches = [dict(row) for row in cur.fetchall()]
+
+        cur.execute("""
+            SELECT batch_id, raw_line, reason, recorded_at
+            FROM malformed_records
+            WHERE run_uuid = %s
+            ORDER BY batch_id, id
+            LIMIT 100
+        """, (run_uuid,))
+        malformed_records = [dict(row) for row in cur.fetchall()]
+
         cur.close()
         conn.close()
 
@@ -368,7 +434,9 @@ def get_results(run_uuid: str):
             "run": run,
             "q1": q1,
             "q2": q2,
-            "q3": q3
+            "q3": q3,
+            "batches": batches,
+            "malformed_records": malformed_records
         }
 
     except Exception as e:
