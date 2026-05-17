@@ -112,11 +112,20 @@ public class NasaLogMapReduce extends Configured implements Tool {
                 );
             }
 
+            String host = logMatch.group(1);
+            String method = logMatch.group(3);
+            String resourcePath = logMatch.group(4);
+            String protocol = logMatch.group(5);
+
+            if (host.isEmpty() || method.isEmpty() || resourcePath.isEmpty() || protocol.isEmpty()) {
+                return null;
+            }
+
             ParsedLog parsed = new ParsedLog();
-            parsed.host = logMatch.group(1);
+            parsed.host = host;
             parsed.logDate = String.format(Locale.US, "%04d-%02d-%02d", year, month, day);
             parsed.logHour = hour;
-            parsed.resourcePath = logMatch.group(4);
+            parsed.resourcePath = resourcePath;
             parsed.statusCode = Integer.parseInt(logMatch.group(6));
             parsed.bytesTransferred = "-".equals(logMatch.group(7))
                 ? 0L

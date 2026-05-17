@@ -250,8 +250,8 @@ WHERE host <> ''
   AND hour_text <> ''
   AND minute_text <> ''
   AND second_text <> ''
-  AND status_text RLIKE '^\\d{3}$'
-  AND (bytes_text = '-' OR bytes_text RLIKE '^\\d+$');
+  AND status_text RLIKE '^\\\\d{{3}}$'
+  AND (bytes_text = '-' OR bytes_text RLIKE '^\\\\d+$');
 
 INSERT OVERWRITE LOCAL DIRECTORY {hql_string(q1_dir)}
 ROW FORMAT DELIMITED FIELDS TERMINATED BY '\\t'
@@ -294,8 +294,8 @@ WHERE NOT (
   AND hour_text <> ''
   AND minute_text <> ''
   AND second_text <> ''
-  AND status_text RLIKE '^\\d{3}$'
-  AND (bytes_text = '-' OR bytes_text RLIKE '^\\d+$')
+  AND status_text RLIKE '^\\\\d{{3}}$'
+  AND (bytes_text = '-' OR bytes_text RLIKE '^\\\\d+$')
 );
 
 DROP DATABASE IF EXISTS {database} CASCADE;
@@ -510,19 +510,101 @@ def _build_hive_env():
         home_hive = os.path.join(os.path.expanduser("~"), "hive")
         if os.path.isdir(home_hive):
             env["HIVE_HOME"] = home_hive
+            
+    # Increase heap space to prevent OOM errors in local MapReduce jobs
+    if "HADOOP_CLIENT_OPTS" in env:
+        env["HADOOP_CLIENT_OPTS"] = env["HADOOP_CLIENT_OPTS"] + " -Xmx2g"
+    else:
+        env["HADOOP_CLIENT_OPTS"] = "-Xmx2g"
+        
     return env
 
 
 def run_hive(hive_bin, hql_path):
-    # Run Hive from a temp directory to avoid Derby metastore lock conflicts.
-    # Each invocation gets its own working directory so concurrent runs don't
-    # collide on the embedded Derby database.
+    # Run Hive from a temp directory with a custom hive-site.xml that forces
+    # local filesystem mode and an embedded Derby metastore.  Each invocation
+    # gets its own working directory so concurrent runs don't collide.
     cwd = tempfile.mkdtemp(prefix="hive_cwd_")
+    warehouse_dir = os.path.join(cwd, "warehouse")
+    metastore_db = os.path.join(cwd, "metastore_db")
+    conf_dir = os.path.join(cwd, "conf")
+    os.makedirs(warehouse_dir, exist_ok=True)
+    os.makedirs(conf_dir, exist_ok=True)
+
+    derby_url = f"jdbc:derby:;databaseName={metastore_db};create=true"
+
+    hive_site = f"""<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<configuration>
+  <property>
+    <name>fs.defaultFS</name>
+    <value>file:///</value>
+  </property>
+  <property>
+    <name>mapreduce.framework.name</name>
+    <value>local</value>
+  </property>
+  <property>
+    <name>hive.exec.mode.local.auto</name>
+    <value>true</value>
+  </property>
+  <property>
+    <name>hive.metastore.warehouse.dir</name>
+    <value>{warehouse_dir}</value>
+  </property>
+  <property>
+    <name>hive.exec.scratchdir</name>
+    <value>{os.path.join(cwd, "scratch")}</value>
+  </property>
+  <property>
+    <name>hive.exec.local.scratchdir</name>
+    <value>{os.path.join(cwd, "local_scratch")}</value>
+  </property>
+  <property>
+    <name>javax.jdo.option.ConnectionURL</name>
+    <value>{derby_url}</value>
+  </property>
+  <property>
+    <name>javax.jdo.option.ConnectionDriverName</name>
+    <value>org.apache.derby.jdbc.EmbeddedDriver</value>
+  </property>
+  <property>
+    <name>javax.jdo.option.ConnectionUserName</name>
+    <value>APP</value>
+  </property>
+  <property>
+    <name>javax.jdo.option.ConnectionPassword</name>
+    <value>mine</value>
+  </property>
+  <property>
+    <name>datanucleus.schema.autoCreateAll</name>
+    <value>true</value>
+  </property>
+  <property>
+    <name>hive.metastore.schema.verification</name>
+    <value>false</value>
+  </property>
+  <property>
+    <name>hive.metastore.uris</name>
+    <value/>
+  </property>
+  <property>
+    <name>hive.server2.enable.doAs</name>
+    <value>false</value>
+  </property>
+</configuration>
+"""
+    with open(os.path.join(conf_dir, "hive-site.xml"), "w") as fh:
+        fh.write(hive_site)
+
+    env = _build_hive_env()
+    env["HIVE_CONF_DIR"] = conf_dir
+
     result = subprocess.run(
         [hive_bin, "-f", hql_path],
         capture_output=True,
         text=True,
-        env=_build_hive_env(),
+        env=env,
         cwd=cwd,
     )
     shutil.rmtree(cwd, ignore_errors=True)

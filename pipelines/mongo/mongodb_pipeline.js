@@ -107,6 +107,10 @@ function parseLogLine(line) {
       bytesTransferred === "-" ? 0 : parseInt(bytesTransferred, 10);
 
     if (
+      !host ||
+      !method ||
+      !resourcePath ||
+      !protocol ||
       !parsedTimestamp ||
       Number.isNaN(parsedStatus) ||
       Number.isNaN(parsedBytes)

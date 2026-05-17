@@ -1,12 +1,14 @@
 # Compiled class file
 *.class
-
+*.dat
 # Log file
 *.log
-
+*lck
+*.txt 
+*.properties
 # BlueJ files
 *.ctxt
-
+*.ctrl
 # Mobile Tools for Java (J2ME)
 .mtj.tmp/
 # Byte-compiled / optimized / DLL files

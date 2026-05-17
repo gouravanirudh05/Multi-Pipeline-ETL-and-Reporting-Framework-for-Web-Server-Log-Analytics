@@ -98,11 +98,39 @@ else
     echo "  No guava conflict detected."
 fi
 
+# Hive ships commons-lang3-3.9.jar, but Hadoop 3.4.x needs 3.18.0 (Range.of() added in 3.10)
+HIVE_LANG3=$(find "$INSTALL_DIR/lib" -name "commons-lang3-*.jar" 2>/dev/null | head -1)
+HADOOP_LANG3=$(find "$HADOOP_HOME/share/hadoop/common/lib" -name "commons-lang3-*.jar" 2>/dev/null | head -1)
+
+if [ -n "$HIVE_LANG3" ] && [ -n "$HADOOP_LANG3" ]; then
+    echo "  Removing: $(basename "$HIVE_LANG3")"
+    rm -f "$HIVE_LANG3"
+    echo "  Copying:  $(basename "$HADOOP_LANG3") from Hadoop"
+    cp "$HADOOP_LANG3" "$INSTALL_DIR/lib/"
+fi
+
 # Also fix SLF4J duplicate binding warning
 SLF4J_LOG4J=$(find "$INSTALL_DIR/lib" -name "log4j-slf4j-impl-*.jar" 2>/dev/null | head -1)
 if [ -n "$SLF4J_LOG4J" ]; then
     echo "  Removing duplicate SLF4J binding: $(basename "$SLF4J_LOG4J")"
     mv "$SLF4J_LOG4J" "${SLF4J_LOG4J}.bak"
+fi
+
+# ── Fix missing commons-collections ──────────────────────────────
+echo ""
+echo "[3.5/5] Fixing missing commons-collections dependency..."
+
+# Hive 3.1.3 relies on commons-collections 3.2.2 but misses it in lib/
+# (it only has commons-collections4). We must manually add it.
+if [ ! -f "$INSTALL_DIR/lib/commons-collections-3.2.2.jar" ]; then
+    echo "  Downloading commons-collections-3.2.2.jar..."
+    if ! command -v wget &>/dev/null; then
+        curl -L -o "$INSTALL_DIR/lib/commons-collections-3.2.2.jar" "https://repo1.maven.org/maven2/commons-collections/commons-collections/3.2.2/commons-collections-3.2.2.jar"
+    else
+        wget -q -O "$INSTALL_DIR/lib/commons-collections-3.2.2.jar" "https://repo1.maven.org/maven2/commons-collections/commons-collections/3.2.2/commons-collections-3.2.2.jar"
+    fi
+else
+    echo "  commons-collections-3.2.2.jar is already present."
 fi
 
 # ── Initialize Derby metastore ────────────────────────────────────

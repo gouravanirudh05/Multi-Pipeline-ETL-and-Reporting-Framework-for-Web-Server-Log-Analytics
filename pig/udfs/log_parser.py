@@ -1,8 +1,9 @@
+# -*- coding: utf-8 -*-
 
 import re
 
 # ------------------------------------------------------------------ #
-# Compiled regex — same pattern as the Node.js MongoDB pipeline.
+# Compiled regex -- same pattern as the Node.js MongoDB pipeline.
 # Groups:
 #   1  host
 #   2  timestamp string  e.g. "01/Jul/1995:00:00:01 -0400"
@@ -23,9 +24,9 @@ MONTH_MAP = {
 }
 
 
-@outputSchema('host:chararray, log_date:chararray, log_hour:int, '
+@outputSchema('parsed:tuple(host:chararray, log_date:chararray, log_hour:int, '
               'method:chararray, resource_path:chararray, '
-              'protocol:chararray, status_code:int, bytes_transferred:long')
+              'protocol:chararray, status_code:int, bytes_transferred:long)')
 def parse_log_line(line):
     """
     Parse one raw NASA HTTP log line into a structured tuple.
@@ -56,6 +57,9 @@ def parse_log_line(line):
         protocol    = match.group(5)
         status_code = int(match.group(6))
         raw_bytes   = match.group(7)
+
+        if not host or not method or not resource or not protocol:
+            return None
 
         # Parse date portion: "01/Jul/1995:00:00:01"
         date_part   = timestamp.split(' ')[0]          # "01/Jul/1995:00:00:01"
