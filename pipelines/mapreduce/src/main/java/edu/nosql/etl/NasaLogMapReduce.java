@@ -289,6 +289,8 @@ public class NasaLogMapReduce extends Configured implements Tool {
         private String batchMode;
         private long batchValue;
         private long firstEpoch;
+        private long firstYear;
+        private long firstMonth;
         private long totalSeen = 0L;
         private long activeBatchId = 1L;
         private long nextTimeBatchId = 1L;
@@ -300,6 +302,8 @@ public class NasaLogMapReduce extends Configured implements Tool {
             batchMode = context.getConfiguration().get("nasa.batch.mode", "records");
             batchValue = context.getConfiguration().getLong("nasa.batch.value", 10000L);
             firstEpoch = context.getConfiguration().getLong("nasa.batch.first.epoch", 0L);
+            firstYear = context.getConfiguration().getLong("nasa.batch.first.year", 0L);
+            firstMonth = context.getConfiguration().getLong("nasa.batch.first.month", 0L);
         }
 
         @Override
@@ -314,7 +318,14 @@ public class NasaLogMapReduce extends Configured implements Tool {
                 if ("records".equals(batchMode)) {
                     batchId = ((totalSeen - 1L) / batchValue) + 1L;
                 } else if (parsed != null) {
-                    long window = Math.floorDiv(parsed.epochSeconds - firstEpoch, batchValue);
+                    long window;
+                    if ("calendar_month".equals(batchMode) && parsed.logDate != null && parsed.logDate.length() >= 7) {
+                        long year = Integer.parseInt(parsed.logDate.substring(0, 4));
+                        long month = Integer.parseInt(parsed.logDate.substring(5, 7));
+                        window = (year - firstYear) * 12 + (month - firstMonth);
+                    } else {
+                        window = Math.floorDiv(parsed.epochSeconds - firstEpoch, batchValue);
+                    }
                     Long existingBatchId = timeWindowBatchIds.get(window);
                     if (existingBatchId == null) {
                         existingBatchId = nextTimeBatchId++;
