@@ -20,7 +20,7 @@ SELECT
   record_number,
   line,
   regexp_extract(line, '^(\\S+) \\S+ \\S+ \\[(.*?)\\] "(\\S+) (.*?) (\\S+)" (\\d{3}) (\\S+)', 1) AS host,
-  regexp_extract(line, '^(\\S+) \\S+ \\S+ \\[(.*?)\\] "(\\S+) (.*?) (\\S+)" (\\d{3}) (\\S+)', 2) AS timestamp_text,
+  COALESCE(NULLIF(regexp_extract(line, '^(\\S+) \\S+ \\S+ \\[(.*?)\\] "(\\S+) (.*?) (\\S+)" (\\d{3}) (\\S+)', 2), ''), regexp_extract(line, '\\[([^\\]]*)\\]', 1)) AS timestamp_text,
   regexp_extract(line, '^(\\S+) \\S+ \\S+ \\[(.*?)\\] "(\\S+) (.*?) (\\S+)" (\\d{3}) (\\S+)', 3) AS method,
   regexp_extract(line, '^(\\S+) \\S+ \\S+ \\[(.*?)\\] "(\\S+) (.*?) (\\S+)" (\\d{3}) (\\S+)', 4) AS resource_path,
   regexp_extract(line, '^(\\S+) \\S+ \\S+ \\[(.*?)\\] "(\\S+) (.*?) (\\S+)" (\\d{3}) (\\S+)', 5) AS protocol,
@@ -100,12 +100,12 @@ SELECT
   CASE
     WHEN '${hivevar:BATCH_MODE}' = 'time' THEN
       CASE
-        WHEN is_valid = 1 THEN floor(cast((unix_timestamp(concat(year_text, '-', month_num, '-', day_text, ' ', hour_text, ':', minute_text, ':', second_text), 'yyyy-MM-dd HH:mm:ss') - min_epoch) AS double) / cast(${hivevar:BATCH_VALUE} AS double)) + 1
+        WHEN year_text <> '' AND month_num IS NOT NULL AND day_text <> '' AND hour_text <> '' AND minute_text <> '' AND second_text <> '' THEN floor(cast((unix_timestamp(concat(year_text, '-', month_num, '-', day_text, ' ', hour_text, ':', minute_text, ':', second_text), 'yyyy-MM-dd HH:mm:ss') - min_epoch) AS double) / cast(${hivevar:BATCH_VALUE} AS double)) + 1
         ELSE 1
       END
     WHEN '${hivevar:BATCH_MODE}' = 'calendar_month' THEN
       CASE
-        WHEN is_valid = 1 THEN ((cast(year_text as int) - min_year) * 12) + (cast(month_num as int) - min_month) + 1
+        WHEN year_text <> '' AND month_num IS NOT NULL THEN ((cast(year_text as int) - min_year) * 12) + (cast(month_num as int) - min_month) + 1
         ELSE 1
       END
     ELSE floor(cast((record_number - 1) AS double) / cast(${hivevar:BATCH_VALUE} AS double)) + 1

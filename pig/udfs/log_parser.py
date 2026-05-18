@@ -99,3 +99,22 @@ def parse_log_line(line):
     except Exception:
         # Any unexpected structure (missing fields, bad int cast, etc.)
         return None
+
+@outputSchema('ts_ext:tuple(timestamp_epoch:long, log_year:int, log_month:int)')
+def extract_timestamp(line):
+    if not line:
+        return None
+    match = re.search(r'\[(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2})', line)
+    if not match:
+        return None
+    try:
+        day, month_str, year, hour, minute, second = match.groups()
+        if month_str not in MONTH_MAP:
+            return None
+        epoch = calendar.timegm((
+            int(year), int(MONTH_MAP[month_str]), int(day),
+            int(hour), int(minute), int(second), 0, 0, 0
+        ))
+        return (long(epoch), int(year), int(MONTH_MAP[month_str]))
+    except Exception:
+        return None

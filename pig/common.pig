@@ -19,13 +19,18 @@ parsed_base = FOREACH ranked_lines GENERATE
         protocol:chararray,
         status_code:int,
         bytes_transferred:long
+    ),
+    logudfs.extract_timestamp(raw_line) AS ts_ext:(
+        timestamp_epoch:long,
+        log_year:int,
+        log_month:int
     );
 
 valid_for_min = FILTER parsed_base BY parsed IS NOT NULL;
 valid_epochs = FOREACH valid_for_min GENERATE 
     parsed.timestamp_epoch AS timestamp_epoch,
-    (int)SUBSTRING(parsed.log_date, 0, 4) AS log_year,
-    (int)SUBSTRING(parsed.log_date, 5, 7) AS log_month;
+    ts_ext.log_year AS log_year,
+    ts_ext.log_month AS log_month;
 epoch_group = GROUP valid_epochs ALL;
 min_epoch_rel = FOREACH epoch_group GENERATE 
     MIN(valid_epochs.timestamp_epoch) AS min_epoch,
@@ -36,11 +41,11 @@ parsed_crossed = CROSS parsed_base, min_epoch_rel;
 parsed_lines = FOREACH parsed_crossed GENERATE
     parsed_base::record_number AS record_number,
     ($BATCH_BY_TIME == 1 ?
-        (parsed_base::parsed IS NULL ? 1 :
+        (parsed_base::ts_ext IS NULL ? 1 :
             ('$BATCH_MODE_STR' == 'calendar_month' ?
-                (((int)SUBSTRING(parsed_base::parsed.log_date, 0, 4) - min_epoch_rel::min_year) * 12) + ((int)SUBSTRING(parsed_base::parsed.log_date, 5, 7) - min_epoch_rel::min_month) + 1
+                ((parsed_base::ts_ext.log_year - min_epoch_rel::min_year) * 12) + (parsed_base::ts_ext.log_month - min_epoch_rel::min_month) + 1
             :
-                ((int)FLOOR(((double)(parsed_base::parsed.timestamp_epoch - min_epoch_rel::min_epoch)) / ((double)$BATCH_VALUE)) + 1)
+                ((int)FLOOR(((double)(parsed_base::ts_ext.timestamp_epoch - min_epoch_rel::min_epoch)) / ((double)$BATCH_VALUE)) + 1)
             )
         )
         :
