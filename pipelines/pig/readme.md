@@ -8,13 +8,13 @@ The Pig pipeline is split into query-specific scripts:
 - `q2_top_resources.pig`: top requested resources
 - `q3_hourly_errors.pig`: hourly error analysis
 
-`pig/run.sh` stages raw logs into HDFS with `hdfs dfs -put`, assembles the selected
+`pipelines/pig/run.sh` stages raw logs into HDFS with `hdfs dfs -put`, assembles the selected
 Pig scripts, executes them with `mapreduce.framework.name=local`, merges the Pig
 output, and loads final TSVs into PostgreSQL. YARN is not required.
 
 ```bash
-./pig/run.sh '["/path/to/NASA_access_log_Jul95"]' records 10000 pig-demo-records
-./pig/run.sh '["/path/to/NASA_access_log_Jul95"]' time 3600 pig-demo-time
+./pipelines/pig/run.sh '["/path/to/NASA_access_log_Jul95"]' records 10000 pig-demo-records
+./pipelines/pig/run.sh '["/path/to/NASA_access_log_Jul95"]' time 3600 pig-demo-time
 ```
 
 Environment:

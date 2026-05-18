@@ -6,8 +6,8 @@
 # for Python UDFs. The project runner executes Pig against Hadoop/HDFS.
 #
 # Usage:
-#   chmod +x pig/setup_pig.sh
-#   ./pig/setup_pig.sh
+#   chmod +x pipelines/pig/setup_pig.sh
+#   ./pipelines/pig/setup_pig.sh
 # -------------------------------------------------------------------
 
 set -euo pipefail

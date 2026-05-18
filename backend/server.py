@@ -345,7 +345,7 @@ async def run_pipeline(req: Request):
     elif pipeline == "pig":
         cmd = [
             "bash",
-            os.path.join(PROJECT_ROOT, "pig", "run.sh"),
+            os.path.join(PROJECT_ROOT, "pipelines", "pig", "run.sh"),
             json.dumps(log_file_paths, separators=(',', ':')),
             batch_mode,
             str(batch_value),
