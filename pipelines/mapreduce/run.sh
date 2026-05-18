@@ -53,8 +53,15 @@ fi
 parse_paths() {
   local raw="$1"
   if [[ "$raw" == \[* ]]; then
-    printf '%s\n' "$raw" \
-      | sed -e 's/^\[//' -e 's/\]$//' -e 's/","/\n/g' -e 's/^"//' -e 's/"$//'
+    raw="${raw#[}"
+    raw="${raw%]}"
+    raw="${raw//\",\"/|}"
+    raw="${raw#\"}"
+    raw="${raw%\"}"
+    IFS='|' read -ra paths <<< "$raw"
+    for p in "${paths[@]}"; do
+      printf '%s\n' "$p"
+    done
   else
     printf '%s\n' "$raw"
   fi
