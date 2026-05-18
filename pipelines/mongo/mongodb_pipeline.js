@@ -165,6 +165,24 @@ async function initializePostgres(pgClient) {
   `);
 
   await pgClient.query(`
+    CREATE TABLE IF NOT EXISTS run_metadata (
+      run_id VARCHAR(64) PRIMARY KEY,
+      pipeline_name VARCHAR(20),
+      query_name VARCHAR(20),
+      batch_size INTEGER,
+      average_batch_size NUMERIC(10,2),
+      records_processed INTEGER,
+      malformed_record_count INTEGER,
+      runtime NUMERIC(10,3),
+      execution_timestamp TIMESTAMPTZ,
+      status VARCHAR(20),
+      batch_mode VARCHAR(20),
+      batch_interval_seconds INTEGER,
+      total_batches INTEGER
+    );
+  `);
+
+  await pgClient.query(`
     CREATE TABLE IF NOT EXISTS batch_metadata (
       id SERIAL PRIMARY KEY,
       run_uuid VARCHAR(64),
@@ -202,6 +220,20 @@ async function initializePostgres(pgClient) {
   `);
 
   await pgClient.query(`
+    CREATE TABLE IF NOT EXISTS query_results (
+      id SERIAL PRIMARY KEY,
+      run_id VARCHAR(64),
+      pipeline_name VARCHAR(20),
+      query_name VARCHAR(20),
+      batch_id INTEGER,
+      result_key TEXT,
+      result_value JSONB,
+      execution_timestamp TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+  await pgClient.query(`ALTER TABLE query_results ADD COLUMN IF NOT EXISTS result_scope VARCHAR(20) DEFAULT 'aggregate';`);
+
+  await pgClient.query(`
     CREATE TABLE IF NOT EXISTS daily_traffic (
       id SERIAL PRIMARY KEY,
       pipeline VARCHAR(20),
@@ -214,6 +246,7 @@ async function initializePostgres(pgClient) {
       total_bytes BIGINT
     );
   `);
+  await pgClient.query(`ALTER TABLE daily_traffic ADD COLUMN IF NOT EXISTS result_scope VARCHAR(20) DEFAULT 'aggregate';`);
 
   await pgClient.query(`
     CREATE TABLE IF NOT EXISTS top_resources (
@@ -228,6 +261,7 @@ async function initializePostgres(pgClient) {
       distinct_host_count BIGINT
     );
   `);
+  await pgClient.query(`ALTER TABLE top_resources ADD COLUMN IF NOT EXISTS result_scope VARCHAR(20) DEFAULT 'aggregate';`);
 
   await pgClient.query(`
     CREATE TABLE IF NOT EXISTS hourly_errors (
@@ -244,13 +278,84 @@ async function initializePostgres(pgClient) {
       distinct_error_hosts BIGINT
     );
   `);
+  await pgClient.query(`ALTER TABLE hourly_errors ADD COLUMN IF NOT EXISTS result_scope VARCHAR(20) DEFAULT 'aggregate';`);
 
   await pgClient.query(`CREATE INDEX IF NOT EXISTS idx_batch_run ON batch_metadata(run_uuid, batch_id);`);
+  await pgClient.query(`CREATE INDEX IF NOT EXISTS idx_run_metadata_run ON run_metadata(run_id);`);
+  await pgClient.query(`CREATE INDEX IF NOT EXISTS idx_query_results_run ON query_results(run_id, query_name);`);
   await pgClient.query(`CREATE INDEX IF NOT EXISTS idx_malformed_summary_run ON malformed_record_summary(run_uuid, batch_id);`);
   await pgClient.query(`CREATE INDEX IF NOT EXISTS idx_malformed_records_run ON malformed_records(run_uuid, batch_id);`);
   await pgClient.query(`CREATE INDEX IF NOT EXISTS idx_daily_pipeline_date ON daily_traffic(pipeline, log_date);`);
   await pgClient.query(`CREATE INDEX IF NOT EXISTS idx_resource_pipeline ON top_resources(pipeline, request_count DESC);`);
   await pgClient.query(`CREATE INDEX IF NOT EXISTS idx_error_pipeline_date ON hourly_errors(pipeline, log_date, log_hour);`);
+}
+
+async function syncReportingTables(pgClient, runUuid, query) {
+  await pgClient.query("DELETE FROM query_results WHERE run_id = $1", [runUuid]);
+  await pgClient.query(
+    `
+    INSERT INTO run_metadata (
+      run_id, pipeline_name, query_name, batch_size, average_batch_size,
+      records_processed, malformed_record_count, runtime, execution_timestamp,
+      status, batch_mode, batch_interval_seconds, total_batches
+    )
+    SELECT run_uuid, pipeline, $2, batch_size, avg_batch_size, total_records,
+           malformed_count, runtime_seconds, COALESCE(started_at, NOW()), status,
+           batch_mode, batch_interval_seconds, total_batches
+    FROM etl_runs
+    WHERE run_uuid = $1
+    ON CONFLICT (run_id) DO UPDATE SET
+      pipeline_name = EXCLUDED.pipeline_name,
+      query_name = EXCLUDED.query_name,
+      batch_size = EXCLUDED.batch_size,
+      average_batch_size = EXCLUDED.average_batch_size,
+      records_processed = EXCLUDED.records_processed,
+      malformed_record_count = EXCLUDED.malformed_record_count,
+      runtime = EXCLUDED.runtime,
+      execution_timestamp = EXCLUDED.execution_timestamp,
+      status = EXCLUDED.status,
+      batch_mode = EXCLUDED.batch_mode,
+      batch_interval_seconds = EXCLUDED.batch_interval_seconds,
+      total_batches = EXCLUDED.total_batches
+    `,
+    [runUuid, query]
+  );
+  await pgClient.query(
+    `
+    INSERT INTO query_results (run_id, pipeline_name, query_name, batch_id, result_scope, result_key, result_value, execution_timestamp)
+    SELECT run_uuid, pipeline, 'q1_daily_traffic', batch_id, result_scope,
+           concat(log_date::text, ':', status_code::text),
+           jsonb_build_object('log_date', log_date, 'status_code', status_code, 'request_count', request_count, 'total_bytes', total_bytes),
+           executed_at
+    FROM daily_traffic
+    WHERE run_uuid = $1
+    `,
+    [runUuid]
+  );
+  await pgClient.query(
+    `
+    INSERT INTO query_results (run_id, pipeline_name, query_name, batch_id, result_scope, result_key, result_value, execution_timestamp)
+    SELECT run_uuid, pipeline, 'q2_top_resources', batch_id, result_scope,
+           resource_path,
+           jsonb_build_object('resource_path', resource_path, 'request_count', request_count, 'total_bytes', total_bytes, 'distinct_host_count', distinct_host_count),
+           executed_at
+    FROM top_resources
+    WHERE run_uuid = $1
+    `,
+    [runUuid]
+  );
+  await pgClient.query(
+    `
+    INSERT INTO query_results (run_id, pipeline_name, query_name, batch_id, result_scope, result_key, result_value, execution_timestamp)
+    SELECT run_uuid, pipeline, 'q3_hourly_errors', batch_id, result_scope,
+           concat(log_date::text, ':', log_hour::text),
+           jsonb_build_object('log_date', log_date, 'log_hour', log_hour, 'error_request_count', error_request_count, 'total_request_count', total_request_count, 'error_rate', error_rate, 'distinct_error_hosts', distinct_error_hosts),
+           executed_at
+    FROM hourly_errors
+    WHERE run_uuid = $1
+    `,
+    [runUuid]
+  );
 }
 
 // ----------------------
@@ -285,8 +390,6 @@ async function writeFinalAggregates(
   pgClient,
   query
 ) {
-  const resultBatchId = totalBatches;
-
   if (query === "all" || query === "q1") {
     await pgClient.query("DELETE FROM daily_traffic WHERE run_uuid = $1", [
       runUuid,
@@ -307,7 +410,7 @@ async function writeFinalAggregates(
   // Query 1: Daily Traffic Summary
   // ----------------------
   if (query === "all" || query === "q1") {
-    console.log("Running Q1 (Daily Traffic) over full run...");
+    console.log("Running Q1 (Daily Traffic) aggregate and per batch...");
     const dailySummary = await logsCollection
       .aggregate(
       [
@@ -315,6 +418,7 @@ async function writeFinalAggregates(
         {
           $group: {
             _id: {
+              batch_id: "$batch_id",
               log_date: "$log_date",
               status_code: "$status_code",
             },
@@ -331,18 +435,44 @@ async function writeFinalAggregates(
       await pgClient.query(
         `
         INSERT INTO daily_traffic
-        (pipeline, run_uuid, batch_id, log_date, status_code, request_count, total_bytes)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        (pipeline, run_uuid, batch_id, result_scope, log_date, status_code, request_count, total_bytes)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         `,
         [
           pipeline,
           runUuid,
-          resultBatchId,
+          row._id.batch_id,
+          "per_batch",
           row._id.log_date,
           row._id.status_code,
           row.request_count,
           row.total_bytes,
         ]
+      );
+    }
+    const dailyAggregate = await logsCollection
+      .aggregate(
+      [
+        { $match: { run_uuid: runUuid } },
+        {
+          $group: {
+            _id: { log_date: "$log_date", status_code: "$status_code" },
+            request_count: { $sum: 1 },
+            total_bytes: { $sum: "$bytes_transferred" },
+          },
+        },
+      ],
+      { allowDiskUse: true }
+      )
+      .toArray();
+    for (const row of dailyAggregate) {
+      await pgClient.query(
+        `
+        INSERT INTO daily_traffic
+        (pipeline, run_uuid, batch_id, result_scope, log_date, status_code, request_count, total_bytes)
+        VALUES ($1, $2, 0, 'aggregate', $3, $4, $5, $6)
+        `,
+        [pipeline, runUuid, row._id.log_date, row._id.status_code, row.request_count, row.total_bytes]
       );
     }
   }
@@ -351,8 +481,54 @@ async function writeFinalAggregates(
   // Query 2: Top Requested Resources
   // ----------------------
   if (query === "all" || query === "q2") {
-    console.log("Running Q2 (Top Resources) over full run...");
+    console.log("Running Q2 (Top Resources) aggregate and per batch...");
     const topResources = await logsCollection
+      .aggregate(
+      [
+        { $match: { run_uuid: runUuid } },
+        {
+          $group: {
+            _id: { batch_id: "$batch_id", resource_path: "$resource_path" },
+            request_count: { $sum: 1 },
+            total_bytes: { $sum: "$bytes_transferred" },
+            distinct_hosts: { $addToSet: "$host" },
+          },
+        },
+        {
+          $project: {
+            batch_id: "$_id.batch_id",
+            resource_path: "$_id.resource_path",
+            request_count: 1,
+            total_bytes: 1,
+            distinct_host_count: { $size: "$distinct_hosts" },
+          },
+        },
+        { $sort: { batch_id: 1, request_count: -1, resource_path: 1 } },
+      ],
+      { allowDiskUse: true }
+      )
+      .toArray();
+
+    for (const row of topResources) {
+      await pgClient.query(
+        `
+        INSERT INTO top_resources
+        (pipeline, run_uuid, batch_id, result_scope, resource_path, request_count, total_bytes, distinct_host_count)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        `,
+        [
+          pipeline,
+          runUuid,
+          row.batch_id,
+          "per_batch",
+          row.resource_path,
+          row.request_count,
+          row.total_bytes,
+          row.distinct_host_count,
+        ]
+      );
+    }
+    const aggregateResources = await logsCollection
       .aggregate(
       [
         { $match: { run_uuid: runUuid } },
@@ -378,23 +554,14 @@ async function writeFinalAggregates(
       { allowDiskUse: true }
       )
       .toArray();
-
-    for (const row of topResources) {
+    for (const row of aggregateResources) {
       await pgClient.query(
         `
         INSERT INTO top_resources
-        (pipeline, run_uuid, batch_id, resource_path, request_count, total_bytes, distinct_host_count)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        (pipeline, run_uuid, batch_id, result_scope, resource_path, request_count, total_bytes, distinct_host_count)
+        VALUES ($1, $2, 0, 'aggregate', $3, $4, $5, $6)
         `,
-        [
-          pipeline,
-          runUuid,
-          resultBatchId,
-          row.resource_path,
-          row.request_count,
-          row.total_bytes,
-          row.distinct_host_count,
-        ]
+        [pipeline, runUuid, row.resource_path, row.request_count, row.total_bytes, row.distinct_host_count]
       );
     }
   }
@@ -403,7 +570,7 @@ async function writeFinalAggregates(
   // Query 3: Hourly Error Analysis
   // ----------------------
   if (query === "all" || query === "q3") {
-    console.log("Running Q3 (Hourly Errors) over full run...");
+    console.log("Running Q3 (Hourly Errors) aggregate and per batch...");
     const hourlyErrors = await logsCollection
       .aggregate(
       [
@@ -411,6 +578,7 @@ async function writeFinalAggregates(
         {
           $group: {
             _id: {
+              batch_id: "$batch_id",
               log_date: "$log_date",
               log_hour: "$log_hour",
             },
@@ -448,6 +616,7 @@ async function writeFinalAggregates(
         {
           $project: {
             log_date: "$_id.log_date",
+            batch_id: "$_id.batch_id",
             log_hour: "$_id.log_hour",
             total_requests: 1,
             error_requests: 1,
@@ -474,13 +643,14 @@ async function writeFinalAggregates(
       await pgClient.query(
         `
         INSERT INTO hourly_errors
-        (pipeline, run_uuid, batch_id, log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        (pipeline, run_uuid, batch_id, result_scope, log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         `,
         [
           pipeline,
           runUuid,
-          resultBatchId,
+          row.batch_id,
+          "per_batch",
           row.log_date,
           row.log_hour,
           row.error_requests,
@@ -488,6 +658,50 @@ async function writeFinalAggregates(
           row.error_rate,
           row.distinct_error_hosts,
         ]
+      );
+    }
+    const aggregateHourlyErrors = await logsCollection
+      .aggregate(
+      [
+        { $match: { run_uuid: runUuid } },
+        {
+          $group: {
+            _id: { log_date: "$log_date", log_hour: "$log_hour" },
+            total_requests: { $sum: 1 },
+            error_requests: {
+              $sum: {
+                $cond: [{ $and: [{ $gte: ["$status_code", 400] }, { $lte: ["$status_code", 599] }] }, 1, 0],
+              },
+            },
+            error_hosts: {
+              $addToSet: {
+                $cond: [{ $and: [{ $gte: ["$status_code", 400] }, { $lte: ["$status_code", 599] }] }, "$host", "$$REMOVE"],
+              },
+            },
+          },
+        },
+        {
+          $project: {
+            log_date: "$_id.log_date",
+            log_hour: "$_id.log_hour",
+            total_requests: 1,
+            error_requests: 1,
+            error_rate: { $cond: [{ $eq: ["$total_requests", 0] }, 0, { $divide: ["$error_requests", "$total_requests"] }] },
+            distinct_error_hosts: { $size: "$error_hosts" },
+          },
+        },
+      ],
+      { allowDiskUse: true }
+      )
+      .toArray();
+    for (const row of aggregateHourlyErrors) {
+      await pgClient.query(
+        `
+        INSERT INTO hourly_errors
+        (pipeline, run_uuid, batch_id, result_scope, log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts)
+        VALUES ($1, $2, 0, 'aggregate', $3, $4, $5, $6, $7, $8)
+        `,
+        [pipeline, runUuid, row.log_date, row.log_hour, row.error_requests, row.total_requests, row.error_rate, row.distinct_error_hosts]
       );
     }
   }
@@ -755,6 +969,7 @@ async function runPipeline(
       runUuid,
     ]
   );
+  await syncReportingTables(pgClient, runUuid, query);
 
   console.log(`
 ╔════════════════════════════════════════════════════════════╗

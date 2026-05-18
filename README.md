@@ -236,6 +236,10 @@ backend/server.py (FastAPI :5050)
     └── pipelines/hive/run.sh        → hdfs dfs -put → hive -f *.hql → PostgreSQL
 ```
 
-All pipelines write to the same PostgreSQL tables: `etl_runs`, `batch_metadata`,
-`malformed_record_summary`, `malformed_records`, `daily_traffic`, `top_resources`,
-and `hourly_errors`.
+All pipelines write to the same PostgreSQL reporting schema. The evaluator-facing
+tables are `run_metadata`, `batch_metadata`, `query_results`, and
+`malformed_record_summary`. Query outputs include both `aggregate` rows
+(`batch_id = 0`) and `per_batch` rows (real source batch IDs), so the UI can
+show final analytics and batch-level processing side by side. The system also
+keeps detailed query-specific tables: `etl_runs`, `malformed_records`,
+`daily_traffic`, `top_resources`, and `hourly_errors`.

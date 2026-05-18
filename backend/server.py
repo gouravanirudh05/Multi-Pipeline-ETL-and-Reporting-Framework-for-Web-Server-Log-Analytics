@@ -86,6 +86,23 @@ def initialize_postgres():
         ADD COLUMN IF NOT EXISTS batch_interval_seconds INTEGER
     """)
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS run_metadata (
+            run_id VARCHAR(64) PRIMARY KEY,
+            pipeline_name VARCHAR(20),
+            query_name VARCHAR(20),
+            batch_size INTEGER,
+            average_batch_size NUMERIC(10,2),
+            records_processed INTEGER,
+            malformed_record_count INTEGER,
+            runtime NUMERIC(10,3),
+            execution_timestamp TIMESTAMPTZ,
+            status VARCHAR(20),
+            batch_mode VARCHAR(20),
+            batch_interval_seconds INTEGER,
+            total_batches INTEGER
+        )
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS batch_metadata (
             id SERIAL PRIMARY KEY,
             run_uuid VARCHAR(64),
@@ -107,6 +124,22 @@ def initialize_postgres():
             malformed_count INTEGER,
             recorded_at TIMESTAMPTZ DEFAULT NOW()
         )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS query_results (
+            id SERIAL PRIMARY KEY,
+            run_id VARCHAR(64),
+            pipeline_name VARCHAR(20),
+            query_name VARCHAR(20),
+            batch_id INTEGER,
+            result_key TEXT,
+            result_value JSONB,
+            execution_timestamp TIMESTAMPTZ DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
+        ALTER TABLE query_results
+        ADD COLUMN IF NOT EXISTS result_scope VARCHAR(20) DEFAULT 'aggregate'
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS malformed_records (
@@ -133,6 +166,10 @@ def initialize_postgres():
         )
     """)
     cur.execute("""
+        ALTER TABLE daily_traffic
+        ADD COLUMN IF NOT EXISTS result_scope VARCHAR(20) DEFAULT 'aggregate'
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS top_resources (
             id SERIAL PRIMARY KEY,
             pipeline VARCHAR(20),
@@ -144,6 +181,10 @@ def initialize_postgres():
             total_bytes BIGINT,
             distinct_host_count BIGINT
         )
+    """)
+    cur.execute("""
+        ALTER TABLE top_resources
+        ADD COLUMN IF NOT EXISTS result_scope VARCHAR(20) DEFAULT 'aggregate'
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS hourly_errors (
@@ -160,12 +201,118 @@ def initialize_postgres():
             distinct_error_hosts BIGINT
         )
     """)
+    cur.execute("""
+        ALTER TABLE hourly_errors
+        ADD COLUMN IF NOT EXISTS result_scope VARCHAR(20) DEFAULT 'aggregate'
+    """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_batch_run ON batch_metadata(run_uuid, batch_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_run_metadata_run ON run_metadata(run_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_query_results_run ON query_results(run_id, query_name)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_malformed_summary_run ON malformed_record_summary(run_uuid, batch_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_malformed_records_run ON malformed_records(run_uuid, batch_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_daily_pipeline_date ON daily_traffic(pipeline, log_date)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_resource_pipeline ON top_resources(pipeline, request_count DESC)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_error_pipeline_date ON hourly_errors(pipeline, log_date, log_hour)")
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def sync_reporting_tables(run_uuid):
+    """Populate evaluator-facing run_metadata and query_results from detailed tables."""
+    initialize_postgres()
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO run_metadata (
+            run_id, pipeline_name, query_name, batch_size, average_batch_size,
+            records_processed, malformed_record_count, runtime,
+            execution_timestamp, status, batch_mode, batch_interval_seconds,
+            total_batches
+        )
+        SELECT
+            run_uuid,
+            pipeline,
+            'all',
+            batch_size,
+            avg_batch_size,
+            total_records,
+            malformed_count,
+            runtime_seconds,
+            COALESCE(started_at, NOW()),
+            status,
+            batch_mode,
+            batch_interval_seconds,
+            total_batches
+        FROM etl_runs
+        WHERE run_uuid = %s
+        ON CONFLICT (run_id) DO UPDATE SET
+            pipeline_name = EXCLUDED.pipeline_name,
+            query_name = EXCLUDED.query_name,
+            batch_size = EXCLUDED.batch_size,
+            average_batch_size = EXCLUDED.average_batch_size,
+            records_processed = EXCLUDED.records_processed,
+            malformed_record_count = EXCLUDED.malformed_record_count,
+            runtime = EXCLUDED.runtime,
+            execution_timestamp = EXCLUDED.execution_timestamp,
+            status = EXCLUDED.status,
+            batch_mode = EXCLUDED.batch_mode,
+            batch_interval_seconds = EXCLUDED.batch_interval_seconds,
+            total_batches = EXCLUDED.total_batches
+    """, (run_uuid,))
+
+    cur.execute("DELETE FROM query_results WHERE run_id = %s", (run_uuid,))
+    cur.execute("""
+        INSERT INTO query_results (
+            run_id, pipeline_name, query_name, batch_id, result_scope, result_key, result_value, execution_timestamp
+        )
+        SELECT run_uuid, pipeline, 'q1_daily_traffic', batch_id, result_scope,
+               concat(log_date::text, ':', status_code::text),
+               jsonb_build_object(
+                   'log_date', log_date,
+                   'status_code', status_code,
+                   'request_count', request_count,
+                   'total_bytes', total_bytes
+               ),
+               executed_at
+        FROM daily_traffic
+        WHERE run_uuid = %s
+    """, (run_uuid,))
+    cur.execute("""
+        INSERT INTO query_results (
+            run_id, pipeline_name, query_name, batch_id, result_scope, result_key, result_value, execution_timestamp
+        )
+        SELECT run_uuid, pipeline, 'q2_top_resources', batch_id, result_scope,
+               resource_path,
+               jsonb_build_object(
+                   'resource_path', resource_path,
+                   'request_count', request_count,
+                   'total_bytes', total_bytes,
+                   'distinct_host_count', distinct_host_count
+               ),
+               executed_at
+        FROM top_resources
+        WHERE run_uuid = %s
+    """, (run_uuid,))
+    cur.execute("""
+        INSERT INTO query_results (
+            run_id, pipeline_name, query_name, batch_id, result_scope, result_key, result_value, execution_timestamp
+        )
+        SELECT run_uuid, pipeline, 'q3_hourly_errors', batch_id, result_scope,
+               concat(log_date::text, ':', log_hour::text),
+               jsonb_build_object(
+                   'log_date', log_date,
+                   'log_hour', log_hour,
+                   'error_request_count', error_request_count,
+                   'total_request_count', total_request_count,
+                   'error_rate', error_rate,
+                   'distinct_error_hosts', distinct_error_hosts
+               ),
+               executed_at
+        FROM hourly_errors
+        WHERE run_uuid = %s
+    """, (run_uuid,))
+
     conn.commit()
     cur.close()
     conn.close()
@@ -318,6 +465,7 @@ async def run_pipeline(req: Request):
                 cur.close()
                 conn.close()
 
+                sync_reporting_tables(run_uuid)
                 yield f"data: {json.dumps({'type': 'done', 'message': run_uuid})}\n\n"
             else:
                 # Mark run as failed
@@ -357,6 +505,8 @@ async def run_pipeline(req: Request):
 # ============ RESULTS ============
 @app.get("/api/run/{run_uuid}")
 def get_results(run_uuid: str):
+    initialize_postgres()
+    sync_reporting_tables(run_uuid)
     conn = get_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
@@ -378,11 +528,23 @@ def get_results(run_uuid: str):
 
         run = dict(run_row)
 
+        cur.execute("""
+            SELECT
+                run_id, pipeline_name, query_name, batch_size,
+                average_batch_size, records_processed, malformed_record_count,
+                runtime, execution_timestamp, status, batch_mode,
+                batch_interval_seconds, total_batches
+            FROM run_metadata
+            WHERE run_id = %s
+        """, (run_uuid,))
+        run_metadata = [dict(row) for row in cur.fetchall()]
+
         # Get Q1 results
         cur.execute("""
             SELECT log_date, status_code, request_count, total_bytes
             FROM daily_traffic 
             WHERE run_uuid = %s
+              AND COALESCE(result_scope, 'aggregate') = 'aggregate'
             ORDER BY log_date DESC
             LIMIT 50
         """, (run_uuid,))
@@ -393,6 +555,7 @@ def get_results(run_uuid: str):
             SELECT resource_path, request_count, total_bytes, distinct_host_count
             FROM top_resources 
             WHERE run_uuid = %s
+              AND COALESCE(result_scope, 'aggregate') = 'aggregate'
             ORDER BY request_count DESC
             LIMIT 20
         """, (run_uuid,))
@@ -403,10 +566,41 @@ def get_results(run_uuid: str):
             SELECT log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts
             FROM hourly_errors 
             WHERE run_uuid = %s
+              AND COALESCE(result_scope, 'aggregate') = 'aggregate'
             ORDER BY log_date DESC, log_hour DESC
             LIMIT 50
         """, (run_uuid,))
         q3 = [dict(row) for row in cur.fetchall()]
+
+        cur.execute("""
+            SELECT batch_id, log_date, status_code, request_count, total_bytes
+            FROM daily_traffic
+            WHERE run_uuid = %s
+              AND result_scope = 'per_batch'
+            ORDER BY batch_id, log_date DESC, status_code
+            LIMIT 150
+        """, (run_uuid,))
+        q1_batches = [dict(row) for row in cur.fetchall()]
+
+        cur.execute("""
+            SELECT batch_id, resource_path, request_count, total_bytes, distinct_host_count
+            FROM top_resources
+            WHERE run_uuid = %s
+              AND result_scope = 'per_batch'
+            ORDER BY batch_id, request_count DESC, resource_path
+            LIMIT 150
+        """, (run_uuid,))
+        q2_batches = [dict(row) for row in cur.fetchall()]
+
+        cur.execute("""
+            SELECT batch_id, log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts
+            FROM hourly_errors
+            WHERE run_uuid = %s
+              AND result_scope = 'per_batch'
+            ORDER BY batch_id, log_date DESC, log_hour DESC
+            LIMIT 150
+        """, (run_uuid,))
+        q3_batches = [dict(row) for row in cur.fetchall()]
 
         cur.execute("""
             SELECT batch_id, batch_size, records_processed, malformed_count,
@@ -417,6 +611,24 @@ def get_results(run_uuid: str):
             LIMIT 100
         """, (run_uuid,))
         batches = [dict(row) for row in cur.fetchall()]
+
+        cur.execute("""
+            SELECT batch_id, malformed_count, recorded_at
+            FROM malformed_record_summary
+            WHERE run_uuid = %s
+            ORDER BY batch_id
+            LIMIT 100
+        """, (run_uuid,))
+        malformed_summary = [dict(row) for row in cur.fetchall()]
+
+        cur.execute("""
+            SELECT query_name, batch_id, result_scope, result_key, result_value, execution_timestamp
+            FROM query_results
+            WHERE run_id = %s
+            ORDER BY query_name, id
+            LIMIT 150
+        """, (run_uuid,))
+        query_results = [dict(row) for row in cur.fetchall()]
 
         cur.execute("""
             SELECT batch_id, raw_line, reason, recorded_at
@@ -435,7 +647,13 @@ def get_results(run_uuid: str):
             "q1": q1,
             "q2": q2,
             "q3": q3,
+            "q1_batches": q1_batches,
+            "q2_batches": q2_batches,
+            "q3_batches": q3_batches,
+            "run_metadata": run_metadata,
             "batches": batches,
+            "malformed_summary": malformed_summary,
+            "query_results": query_results,
             "malformed_records": malformed_records
         }
 
