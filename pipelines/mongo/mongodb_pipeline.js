@@ -752,7 +752,7 @@ async function runPipeline(
       if (isTimeBatching && parsed) {
         rawBatchId = timeBatcher.assign(parsed.timestamp_epoch);
       } else if (isCalendarMonthBatching && parsed) {
-        rawBatchId = timeBatcher.assign(parsed.logDate);
+        rawBatchId = timeBatcher.assign(parsed.log_date);
       }
 
       const stats = ensureBatchStats(rawBatchId);

@@ -335,7 +335,7 @@ async def run_pipeline(req: Request):
         cmd = [
             "node",
             os.path.join(PROJECT_ROOT, "pipelines", "mongo","mongodb_pipeline.js"),
-            json.dumps(log_file_paths),
+            json.dumps(log_file_paths, separators=(',', ':')),
             batch_mode,
             str(batch_value),
             run_uuid,
@@ -346,7 +346,7 @@ async def run_pipeline(req: Request):
         cmd = [
             "bash",
             os.path.join(PROJECT_ROOT, "pig", "run.sh"),
-            json.dumps(log_file_paths),
+            json.dumps(log_file_paths, separators=(',', ':')),
             batch_mode,
             str(batch_value),
             run_uuid,
@@ -357,7 +357,7 @@ async def run_pipeline(req: Request):
         cmd = [
             "bash",
             os.path.join(PROJECT_ROOT, "pipelines", "mapreduce", "run.sh"),
-            json.dumps(log_file_paths),
+            json.dumps(log_file_paths, separators=(',', ':')),
             batch_mode,
             str(batch_value),
             run_uuid,
@@ -368,7 +368,7 @@ async def run_pipeline(req: Request):
         cmd = [
             "bash",
             os.path.join(PROJECT_ROOT, "pipelines", "hive", "run.sh"),
-            json.dumps(log_file_paths),
+            json.dumps(log_file_paths, separators=(',', ':')),
             batch_mode,
             str(batch_value),
             run_uuid,
