@@ -713,7 +713,6 @@ async function runPipeline(
   let totalRecords = 0;
   let validRecords = 0;
   let totalBatches = 0;
-  const timeBatcher = createTimeBatchAssigner(batchValue);
   const batchStats = new Map();
 
   function ensureBatchStats(id) {
