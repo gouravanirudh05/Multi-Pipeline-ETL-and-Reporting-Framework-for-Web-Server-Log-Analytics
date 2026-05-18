@@ -44,6 +44,11 @@ BATCH_MODE="$2"
 BATCH_VALUE="$3"
 RUN_UUID="$4"
 QUERY="${5:-all}"
+AGGREGATION_MODE="${6:-global}"
+if [[ "$AGGREGATION_MODE" != "global" && "$AGGREGATION_MODE" != "per_batch" ]]; then
+  echo "ERROR: aggregation_mode must be global or per_batch" >&2
+  exit 1
+fi
 
 parse_paths() {
   local raw="$1"
@@ -63,6 +68,12 @@ for log_file in "${LOG_FILES[@]}"; do
   fi
 done
 
+LOCAL_STAGE_DIR="$(mktemp -d /tmp/nasa-mapreduce-input.XXXXXX)"
+cleanup() {
+  rm -rf "$LOCAL_STAGE_DIR"
+}
+trap cleanup EXIT
+
 BASE_HDFS_DIR="${HDFS_WORK_DIR:-/tmp/nasa-etl/mapreduce/$RUN_UUID}"
 INPUT_DIR="$BASE_HDFS_DIR/input"
 
@@ -70,16 +81,21 @@ echo "Staging MapReduce input logs in HDFS..."
 "${DFS_CMD[@]}" -rm -r -f "$BASE_HDFS_DIR" >/dev/null 2>&1 || true
 "${DFS_CMD[@]}" -mkdir -p "$INPUT_DIR"
 for log_file in "${LOG_FILES[@]}"; do
+  staged_file="$log_file"
+  if [[ "$log_file" == *" "* ]]; then
+    staged_file="$LOCAL_STAGE_DIR/$(basename "$log_file")"
+    cp "$log_file" "$staged_file"
+  fi
   echo "Uploading $(basename "$log_file") to HDFS"
-  "${DFS_CMD[@]}" -put -f "$log_file" "$INPUT_DIR/"
+  "${DFS_CMD[@]}" -put -f "$staged_file" "$INPUT_DIR/"
 done
 
 rm -rf "$CLASSES_DIR"
 mkdir -p "$CLASSES_DIR"
-find "$SRC_DIR" -name "*.java" | sort > "$SOURCES_FILE"
+(cd "$SRC_DIR" && find . -name "*.java" | sort) > "$SOURCES_FILE"
 
 echo "Compiling Java MapReduce pipeline..."
-javac -source 8 -target 8 -cp "$("$HADOOP_BIN" classpath)" -d "$CLASSES_DIR" @"$SOURCES_FILE"
+(cd "$SRC_DIR" && javac -source 8 -target 8 -cp "$("$HADOOP_BIN" classpath)" -d "$CLASSES_DIR" @"$SOURCES_FILE")
 
 echo "Packaging MapReduce jar..."
 jar cf "$JAR_PATH" -C "$CLASSES_DIR" .
@@ -87,4 +103,4 @@ jar cf "$JAR_PATH" -C "$CLASSES_DIR" .
 echo "Running Hadoop MapReduce jobs..."
 "$HADOOP_BIN" jar "$JAR_PATH" edu.nosql.etl.NasaLogMapReduce \
   -Dmapreduce.framework.name=local \
-  "$INPUT_DIR" "$BATCH_MODE" "$BATCH_VALUE" "$RUN_UUID" "$QUERY"
+  "$INPUT_DIR" "$BATCH_MODE" "$BATCH_VALUE" "$RUN_UUID" "$QUERY" "$AGGREGATION_MODE"

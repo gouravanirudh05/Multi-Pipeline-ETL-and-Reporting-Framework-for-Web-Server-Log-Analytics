@@ -6,8 +6,9 @@ RUN_UUID="$2"
 BATCH_MODE="$3"
 BATCH_VALUE="$4"
 OUTPUT_DIR="$5"
-QUERY="${6:-all}"
-RUNTIME_SECONDS="${7:-0}"
+AGGREGATION_MODE="${6:-global}"
+QUERY="${7:-all}"
+RUNTIME_SECONDS="${8:-0}"
 
 PGHOST="${PGHOST:-127.0.0.1}"
 PGPORT="${PGPORT:-5432}"
@@ -17,6 +18,13 @@ PGPASSWORD="${PGPASSWORD:-welcome}"
 export PGPASSWORD
 
 SQL_FILE="$(mktemp)"
+SANITIZED_COPY_DIR="$(mktemp -d)"
+
+cleanup() {
+    rm -f "$SQL_FILE"
+    rm -rf "$SANITIZED_COPY_DIR"
+}
+trap cleanup EXIT
 
 cat > "$SQL_FILE" <<SQL
 \\set ON_ERROR_STOP on
@@ -36,6 +44,7 @@ CREATE TABLE IF NOT EXISTS etl_runs (
 );
 ALTER TABLE etl_runs ADD COLUMN IF NOT EXISTS batch_mode VARCHAR(20) DEFAULT 'records';
 ALTER TABLE etl_runs ADD COLUMN IF NOT EXISTS batch_interval_seconds INTEGER;
+ALTER TABLE etl_runs ADD COLUMN IF NOT EXISTS aggregation_mode VARCHAR(20) DEFAULT 'global';
 
 CREATE TABLE IF NOT EXISTS batch_metadata (
     id SERIAL PRIMARY KEY,
@@ -108,13 +117,14 @@ CREATE INDEX IF NOT EXISTS idx_resource_pipeline ON top_resources(pipeline, requ
 CREATE INDEX IF NOT EXISTS idx_error_pipeline_date ON hourly_errors(pipeline, log_date, log_hour);
 
 INSERT INTO etl_runs
-    (run_uuid, pipeline, batch_size, batch_mode, batch_interval_seconds, status, started_at)
+    (run_uuid, pipeline, batch_size, batch_mode, batch_interval_seconds, aggregation_mode, status, started_at)
 VALUES
-    ('$RUN_UUID', '$PIPELINE', $(if [[ "$BATCH_MODE" == "records" ]]; then printf "%s" "$BATCH_VALUE"; else printf "NULL"; fi), '$BATCH_MODE', $(if [[ "$BATCH_MODE" == "time" ]]; then printf "%s" "$BATCH_VALUE"; else printf "NULL"; fi), 'running', NOW())
+    ('$RUN_UUID', '$PIPELINE', $(if [[ "$BATCH_MODE" == "records" ]]; then printf "%s" "$BATCH_VALUE"; else printf "NULL"; fi), '$BATCH_MODE', $(if [[ "$BATCH_MODE" == "time" ]]; then printf "%s" "$BATCH_VALUE"; else printf "NULL"; fi), '$AGGREGATION_MODE', 'running', NOW())
 ON CONFLICT (run_uuid) DO UPDATE SET
     pipeline = EXCLUDED.pipeline,
     batch_size = EXCLUDED.batch_size,
     batch_mode = EXCLUDED.batch_mode,
+    aggregation_mode = EXCLUDED.aggregation_mode,
     batch_interval_seconds = EXCLUDED.batch_interval_seconds,
     status = EXCLUDED.status;
 
@@ -142,7 +152,21 @@ CREATE TEMP TABLE tmp_q1 (
     request_count BIGINT,
     total_bytes BIGINT
 );
+CREATE TEMP TABLE tmp_q1_batch (
+    batch_id INTEGER,
+    log_date DATE,
+    status_code INTEGER,
+    request_count BIGINT,
+    total_bytes BIGINT
+);
 CREATE TEMP TABLE tmp_q2 (
+    resource_path TEXT,
+    request_count BIGINT,
+    total_bytes BIGINT,
+    distinct_host_count BIGINT
+);
+CREATE TEMP TABLE tmp_q2_batch (
+    batch_id INTEGER,
     resource_path TEXT,
     request_count BIGINT,
     total_bytes BIGINT,
@@ -156,21 +180,61 @@ CREATE TEMP TABLE tmp_q3 (
     error_rate NUMERIC,
     distinct_error_hosts BIGINT
 );
+CREATE TEMP TABLE tmp_q3_batch (
+    batch_id INTEGER,
+    log_date DATE,
+    log_hour SMALLINT,
+    error_request_count BIGINT,
+    total_request_count BIGINT,
+    error_rate NUMERIC,
+    distinct_error_hosts BIGINT
+);
 SQL
 
 copy_if_present() {
     local table="$1"
     local file="$2"
     if [[ -s "$file" ]]; then
-        printf "\\copy %s FROM '%s' WITH (FORMAT csv, DELIMITER E'\\t', QUOTE E'\\b')\n" "$table" "$file" >> "$SQL_FILE"
+        local copy_source="$file"
+        local sanitized_file="$SANITIZED_COPY_DIR/$(basename "$file")"
+        # PostgreSQL COPY expects valid UTF-8 text; Hive malformed rows can
+        # carry stray bytes from the original logs, so strip only invalid
+        # byte sequences before import.
+        if iconv -f UTF-8 -t UTF-8 "$file" > /dev/null 2>&1; then
+            copy_source="$file"
+        elif command -v iconv >/dev/null 2>&1; then
+            iconv -f UTF-8 -t UTF-8 -c "$file" > "$sanitized_file"
+            copy_source="$sanitized_file"
+        else
+            copy_source="$file"
+        fi
+        printf "\\copy %s FROM '%s' WITH (FORMAT csv, DELIMITER E'\\t', QUOTE E'\\b')\n" "$table" "$copy_source" >> "$SQL_FILE"
     fi
 }
 
 copy_if_present tmp_batch_metadata "$OUTPUT_DIR/batch_metadata.tsv"
 copy_if_present tmp_malformed_records "$OUTPUT_DIR/malformed_records.tsv"
-[[ "$QUERY" == "all" || "$QUERY" == "q1" ]] && copy_if_present tmp_q1 "$OUTPUT_DIR/q1.tsv"
-[[ "$QUERY" == "all" || "$QUERY" == "q2" ]] && copy_if_present tmp_q2 "$OUTPUT_DIR/q2.tsv"
-[[ "$QUERY" == "all" || "$QUERY" == "q3" ]] && copy_if_present tmp_q3 "$OUTPUT_DIR/q3.tsv"
+if [[ "$QUERY" == "all" || "$QUERY" == "q1" ]]; then
+    if [[ "$AGGREGATION_MODE" == "per_batch" ]]; then
+        copy_if_present tmp_q1_batch "$OUTPUT_DIR/q1.tsv"
+    else
+        copy_if_present tmp_q1 "$OUTPUT_DIR/q1.tsv"
+    fi
+fi
+if [[ "$QUERY" == "all" || "$QUERY" == "q2" ]]; then
+    if [[ "$AGGREGATION_MODE" == "per_batch" ]]; then
+        copy_if_present tmp_q2_batch "$OUTPUT_DIR/q2.tsv"
+    else
+        copy_if_present tmp_q2 "$OUTPUT_DIR/q2.tsv"
+    fi
+fi
+if [[ "$QUERY" == "all" || "$QUERY" == "q3" ]]; then
+    if [[ "$AGGREGATION_MODE" == "per_batch" ]]; then
+        copy_if_present tmp_q3_batch "$OUTPUT_DIR/q3.tsv"
+    else
+        copy_if_present tmp_q3 "$OUTPUT_DIR/q3.tsv"
+    fi
+fi
 
 cat >> "$SQL_FILE" <<SQL
 INSERT INTO batch_metadata
@@ -195,17 +259,35 @@ SELECT '$PIPELINE', '$RUN_UUID', COALESCE((SELECT max(batch_id) FROM tmp_batch_m
        log_date, status_code, request_count, total_bytes
 FROM tmp_q1;
 
+INSERT INTO daily_traffic
+    (pipeline, run_uuid, batch_id, log_date, status_code, request_count, total_bytes)
+SELECT '$PIPELINE', '$RUN_UUID', batch_id,
+       log_date, status_code, request_count, total_bytes
+FROM tmp_q1_batch;
+
 INSERT INTO top_resources
     (pipeline, run_uuid, batch_id, resource_path, request_count, total_bytes, distinct_host_count)
 SELECT '$PIPELINE', '$RUN_UUID', COALESCE((SELECT max(batch_id) FROM tmp_batch_metadata), 0),
        resource_path, request_count, total_bytes, distinct_host_count
 FROM tmp_q2;
 
+INSERT INTO top_resources
+    (pipeline, run_uuid, batch_id, resource_path, request_count, total_bytes, distinct_host_count)
+SELECT '$PIPELINE', '$RUN_UUID', batch_id,
+       resource_path, request_count, total_bytes, distinct_host_count
+FROM tmp_q2_batch;
+
 INSERT INTO hourly_errors
     (pipeline, run_uuid, batch_id, log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts)
 SELECT '$PIPELINE', '$RUN_UUID', COALESCE((SELECT max(batch_id) FROM tmp_batch_metadata), 0),
        log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts
 FROM tmp_q3;
+
+INSERT INTO hourly_errors
+    (pipeline, run_uuid, batch_id, log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts)
+SELECT '$PIPELINE', '$RUN_UUID', batch_id,
+       log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts
+FROM tmp_q3_batch;
 
 UPDATE etl_runs
 SET total_records = COALESCE((SELECT sum(records_processed) FROM tmp_batch_metadata), 0),
@@ -216,9 +298,9 @@ SET total_records = COALESCE((SELECT sum(records_processed) FROM tmp_batch_metad
     status = 'completed',
     completed_at = NOW(),
     batch_mode = '$BATCH_MODE',
+    aggregation_mode = '$AGGREGATION_MODE',
     batch_interval_seconds = $(if [[ "$BATCH_MODE" == "time" ]]; then printf "%s" "$BATCH_VALUE"; else printf "NULL"; fi)
 WHERE run_uuid = '$RUN_UUID';
 SQL
 
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -f "$SQL_FILE"
-rm -f "$SQL_FILE"

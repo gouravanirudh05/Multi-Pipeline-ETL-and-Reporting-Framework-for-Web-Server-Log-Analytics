@@ -553,7 +553,7 @@
       <div style="display:flex; flex-direction:column; gap:12px;">
         <div class="form-group">
           <label class="form-label">Log file paths (one per line)</label>
-          <textarea id="log-files" class="form-input" placeholder="/data/NASA_access_log_Jul95&#10;/data/NASA_access_log_Aug95"></textarea>
+          <textarea id="log-files" class="form-input" placeholder="data/access_log_Aug95&#10;/app/data/access_log_Aug95"></textarea>
         </div>
         <div class="form-group">
           <label class="form-label">Query</label>
@@ -562,6 +562,13 @@
             <option value="q1">Q1 - Daily Traffic Summary</option>
             <option value="q2">Q2 - Top Requested Resources</option>
             <option value="q3">Q3 - Hourly Error Analysis</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Aggregation mode</label>
+          <select id="aggregation-mode" class="form-input">
+            <option value="global">Global after all batches</option>
+            <option value="per_batch">Per batch</option>
           </select>
         </div>
         <div class="form-group">
@@ -660,6 +667,7 @@
   batch_size       INTEGER
   batch_mode       VARCHAR(20)    -- records | time
   batch_interval_seconds INTEGER
+  aggregation_mode VARCHAR(20)    -- global | per_batch
   total_records    INTEGER
   total_batches    INTEGER
   avg_batch_size   NUMERIC(10,2)
@@ -838,6 +846,7 @@ async function triggerRun() {
   const batchMinutes = parseInt(document.getElementById("batch-minutes").value) || 60;
   const batchIntervalSeconds = batchMinutes * 60;
   const query = document.getElementById("query-select").value || "all";
+  const aggregationMode = document.getElementById("aggregation-mode").value || "global";
   const logFiles  = filesRaw.split("\n").map(s => s.trim()).filter(Boolean);
 
   if (!logFiles.length) {
@@ -861,6 +870,7 @@ async function triggerRun() {
   appendLog(`Starting ${selectedPipeline.toUpperCase()} pipeline...`, "info");
   appendLog(`  Files: ${logFiles.join(", ")}`, "info");
   appendLog(`  Query: ${query}`, "info");
+  appendLog(`  Aggregation: ${aggregationMode}`, "info");
   appendLog(`  Batch mode: ${batchMode}`, "info");
   appendLog(`  ${batchMode === "time" ? "Time window" : "Batch size"}: ${batchMode === "time" ? batchMinutes.toLocaleString() + " min" : batchSize.toLocaleString()}`, "info");
   appendLog("-".repeat(60), "info");
@@ -874,6 +884,7 @@ async function triggerRun() {
       body: JSON.stringify({ 
         pipeline: selectedPipeline, 
         batch_mode: batchMode,
+        aggregation_mode: aggregationMode,
         query,
         batch_size: batchSize, 
         batch_interval_seconds: batchIntervalSeconds,
@@ -984,6 +995,16 @@ function renderResults(data) {
   const batchDisplay = mode === "time"
     ? `${Math.round((run.batch_interval_seconds || 0) / 60)} min`
     : `${(run.batch_size || 0).toLocaleString()} rec`;
+  const aggregationMode = run.aggregation_mode || "global";
+  const resultColumnsQ1 = aggregationMode === "per_batch"
+    ? ["batch_id","log_date","status_code","request_count","total_bytes"]
+    : ["log_date","status_code","request_count","total_bytes"];
+  const resultColumnsQ2 = aggregationMode === "per_batch"
+    ? ["batch_id","resource_path","request_count","total_bytes","distinct_host_count"]
+    : ["resource_path","request_count","total_bytes","distinct_host_count"];
+  const resultColumnsQ3 = aggregationMode === "per_batch"
+    ? ["batch_id","log_date","log_hour","error_request_count","total_request_count","error_rate","distinct_error_hosts"]
+    : ["log_date","log_hour","error_request_count","total_request_count","error_rate","distinct_error_hosts"];
 
   container.innerHTML = `
     <div class="stats-row">
@@ -993,6 +1014,7 @@ function renderResults(data) {
       <div class="stat-chip"><div class="sv">${run.total_batches||0}</div><div class="sk">Batches</div></div>
       <div class="stat-chip"><div class="sv">${mode}</div><div class="sk">Batch Mode</div></div>
       <div class="stat-chip"><div class="sv">${batchDisplay}</div><div class="sk">Batch Unit</div></div>
+      <div class="stat-chip"><div class="sv">${aggregationMode}</div><div class="sk">Aggregation</div></div>
       <div class="stat-chip"><div class="sv">${run.runtime_seconds ? run.runtime_seconds.toFixed(2)+'s' : '-'}</div><div class="sk">Runtime</div></div>
       <div class="stat-chip"><div class="sv">${run.malformed_count||0}</div><div class="sk">Malformed</div></div>
       <div class="stat-chip"><div class="sv">${run.avg_batch_size ? parseFloat(run.avg_batch_size).toFixed(0) : '-'}</div><div class="sk">Avg Batch</div></div>
@@ -1005,17 +1027,17 @@ function renderResults(data) {
 
     <div class="result-section">
       <h3>Q1 - Daily Traffic Summary <span class="badge">${(data.q1||[]).length} rows</span></h3>
-      ${tableHtml(data.q1||[], ["log_date","status_code","request_count","total_bytes"])}
+      ${tableHtml(data.q1||[], resultColumnsQ1)}
     </div>
 
     <div class="result-section">
       <h3>Q2 - Top Requested Resources <span class="badge">${(data.q2||[]).length} rows</span></h3>
-      ${tableHtml(data.q2||[], ["resource_path","request_count","total_bytes","distinct_host_count"])}
+      ${tableHtml(data.q2||[], resultColumnsQ2, aggregationMode === "per_batch" ? 200 : 50)}
     </div>
 
     <div class="result-section">
       <h3>Q3 - Hourly Error Analysis <span class="badge">${(data.q3||[]).length} rows</span></h3>
-      ${tableHtml(data.q3||[], ["log_date","log_hour","error_request_count","total_request_count","error_rate","distinct_error_hosts"])}
+      ${tableHtml(data.q3||[], resultColumnsQ3)}
     </div>
   `;
 }
@@ -1063,7 +1085,7 @@ async function loadHistory() {
         <div class="hist-dot ${r.status}"></div>
         <div class="hist-info">
           <div class="hist-name">${(r.pipeline||'').toUpperCase()}</div>
-          <div class="hist-meta">${(r.total_records||0).toLocaleString()} rec | ${r.total_batches||0} batches | ${(r.batch_mode || 'records')} | ${r.runtime_seconds ? r.runtime_seconds.toFixed(1)+'s' : '...'}</div>
+          <div class="hist-meta">${(r.total_records||0).toLocaleString()} rec | ${r.total_batches||0} batches | ${(r.batch_mode || 'records')} | ${(r.aggregation_mode || 'global')} | ${r.runtime_seconds ? r.runtime_seconds.toFixed(1)+'s' : '...'}</div>
         </div>
         <div class="hist-time">${r.started_at ? new Date(r.started_at).toLocaleTimeString() : ''}</div>
       </div>`).join("");

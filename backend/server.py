@@ -86,6 +86,10 @@ def initialize_postgres():
         ADD COLUMN IF NOT EXISTS batch_interval_seconds INTEGER
     """)
     cur.execute("""
+        ALTER TABLE etl_runs
+        ADD COLUMN IF NOT EXISTS aggregation_mode VARCHAR(20) DEFAULT 'global'
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS batch_metadata (
             id SERIAL PRIMARY KEY,
             run_uuid VARCHAR(64),
@@ -160,6 +164,87 @@ def initialize_postgres():
             distinct_error_hosts BIGINT
         )
     """)
+    # Backfill schema changes for users who already have older local tables.
+    table_columns = {
+        "etl_runs": [
+            ("pipeline", "VARCHAR(20)"),
+            ("batch_size", "INTEGER"),
+            ("total_records", "INTEGER"),
+            ("total_batches", "INTEGER"),
+            ("avg_batch_size", "NUMERIC(10,2)"),
+            ("malformed_count", "INTEGER"),
+            ("runtime_seconds", "NUMERIC(10,3)"),
+            ("status", "VARCHAR(20)"),
+            ("started_at", "TIMESTAMPTZ"),
+            ("completed_at", "TIMESTAMPTZ"),
+            ("batch_mode", "VARCHAR(20) DEFAULT 'records'"),
+            ("batch_interval_seconds", "INTEGER"),
+            ("aggregation_mode", "VARCHAR(20) DEFAULT 'global'"),
+        ],
+        "batch_metadata": [
+            ("run_uuid", "VARCHAR(64)"),
+            ("pipeline", "VARCHAR(20)"),
+            ("batch_id", "INTEGER"),
+            ("batch_size", "INTEGER"),
+            ("records_processed", "INTEGER"),
+            ("malformed_count", "INTEGER DEFAULT 0"),
+            ("started_at", "TIMESTAMPTZ DEFAULT NOW()"),
+            ("completed_at", "TIMESTAMPTZ DEFAULT NOW()"),
+        ],
+        "malformed_record_summary": [
+            ("run_uuid", "VARCHAR(64)"),
+            ("pipeline", "VARCHAR(20)"),
+            ("batch_id", "INTEGER"),
+            ("malformed_count", "INTEGER"),
+            ("recorded_at", "TIMESTAMPTZ DEFAULT NOW()"),
+        ],
+        "malformed_records": [
+            ("run_uuid", "VARCHAR(64)"),
+            ("pipeline", "VARCHAR(20)"),
+            ("batch_id", "INTEGER"),
+            ("raw_line", "TEXT"),
+            ("reason", "TEXT"),
+            ("recorded_at", "TIMESTAMPTZ DEFAULT NOW()"),
+        ],
+        "daily_traffic": [
+            ("pipeline", "VARCHAR(20)"),
+            ("run_uuid", "VARCHAR(64)"),
+            ("batch_id", "INTEGER"),
+            ("executed_at", "TIMESTAMPTZ DEFAULT NOW()"),
+            ("log_date", "DATE"),
+            ("status_code", "INTEGER"),
+            ("request_count", "BIGINT"),
+            ("total_bytes", "BIGINT"),
+        ],
+        "top_resources": [
+            ("id", "BIGSERIAL"),
+            ("pipeline", "VARCHAR(20)"),
+            ("run_uuid", "VARCHAR(64)"),
+            ("batch_id", "INTEGER"),
+            ("executed_at", "TIMESTAMPTZ DEFAULT NOW()"),
+            ("resource_path", "TEXT"),
+            ("request_count", "BIGINT"),
+            ("total_bytes", "BIGINT"),
+            ("distinct_host_count", "BIGINT"),
+        ],
+        "hourly_errors": [
+            ("pipeline", "VARCHAR(20)"),
+            ("run_uuid", "VARCHAR(64)"),
+            ("batch_id", "INTEGER"),
+            ("executed_at", "TIMESTAMPTZ DEFAULT NOW()"),
+            ("log_date", "DATE"),
+            ("log_hour", "SMALLINT"),
+            ("error_request_count", "BIGINT"),
+            ("total_request_count", "BIGINT"),
+            ("error_rate", "NUMERIC(6,4)"),
+            ("distinct_error_hosts", "BIGINT"),
+        ],
+    }
+    for table_name, columns in table_columns.items():
+        for column_name, column_type in columns:
+            cur.execute(
+                f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {column_name} {column_type}"
+            )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_batch_run ON batch_metadata(run_uuid, batch_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_malformed_summary_run ON malformed_record_summary(run_uuid, batch_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_malformed_records_run ON malformed_records(run_uuid, batch_id)")
@@ -189,6 +274,7 @@ async def run_pipeline(req: Request):
     body = await req.json()
     pipeline = body.get("pipeline")
     batch_mode = body.get("batch_mode", "records")
+    aggregation_mode = body.get("aggregation_mode", "global")
     batch_size = int(body.get("batch_size", 10000) or 10000)
     batch_interval_seconds = int(body.get("batch_interval_seconds", 3600) or 3600)
     query = body.get("query", "all")
@@ -198,6 +284,8 @@ async def run_pipeline(req: Request):
         return {"error": "Missing pipeline or log_files"}
     if batch_mode not in {"records", "time"}:
         return {"error": "batch_mode must be 'records' or 'time'"}
+    if aggregation_mode not in {"global", "per_batch"}:
+        return {"error": "aggregation_mode must be 'global' or 'per_batch'"}
     if batch_size <= 0:
         return {"error": "batch_size must be greater than 0"}
     if batch_interval_seconds <= 0:
@@ -222,14 +310,15 @@ async def run_pipeline(req: Request):
     try:
         cur.execute("""
             INSERT INTO etl_runs 
-            (pipeline, run_uuid, batch_size, batch_mode, batch_interval_seconds, status, started_at)
-            VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            (pipeline, run_uuid, batch_size, batch_mode, batch_interval_seconds, aggregation_mode, status, started_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
         """, (
             pipeline,
             run_uuid,
             batch_size,
             batch_mode,
             batch_interval_seconds if batch_mode == "time" else None,
+            aggregation_mode,
             "running"
         ))
 
@@ -252,7 +341,8 @@ async def run_pipeline(req: Request):
             batch_mode,
             str(batch_value),
             run_uuid,
-            query
+            query,
+            aggregation_mode
         ]
     elif pipeline == "pig":
         cmd = [
@@ -262,7 +352,8 @@ async def run_pipeline(req: Request):
             batch_mode,
             str(batch_value),
             run_uuid,
-            query
+            query,
+            aggregation_mode
         ]
     elif pipeline == "mapreduce":
         cmd = [
@@ -272,7 +363,8 @@ async def run_pipeline(req: Request):
             batch_mode,
             str(batch_value),
             run_uuid,
-            query
+            query,
+            aggregation_mode
         ]
     elif pipeline == "hive":
         cmd = [
@@ -282,7 +374,8 @@ async def run_pipeline(req: Request):
             batch_mode,
             str(batch_value),
             run_uuid,
-            query
+            query,
+            aggregation_mode
         ]
     else:
         return {"error": f"Unknown pipeline: {pipeline}"}
@@ -365,6 +458,7 @@ def get_results(run_uuid: str):
         cur.execute("""
             SELECT 
                 pipeline, run_uuid, batch_size, batch_mode, batch_interval_seconds,
+                aggregation_mode,
                 total_records, total_batches, avg_batch_size, 
                 malformed_count, runtime_seconds, status, 
                 started_at, completed_at
@@ -380,30 +474,30 @@ def get_results(run_uuid: str):
 
         # Get Q1 results
         cur.execute("""
-            SELECT log_date, status_code, request_count, total_bytes
+            SELECT batch_id, log_date, status_code, request_count, total_bytes
             FROM daily_traffic 
             WHERE run_uuid = %s
-            ORDER BY log_date DESC
+            ORDER BY batch_id DESC, log_date DESC
             LIMIT 50
         """, (run_uuid,))
         q1 = [dict(row) for row in cur.fetchall()]
 
         # Get Q2 results
         cur.execute("""
-            SELECT resource_path, request_count, total_bytes, distinct_host_count
+            SELECT batch_id, resource_path, request_count, total_bytes, distinct_host_count
             FROM top_resources 
             WHERE run_uuid = %s
-            ORDER BY request_count DESC
-            LIMIT 20
+            ORDER BY batch_id DESC, request_count DESC
+            LIMIT 100
         """, (run_uuid,))
         q2 = [dict(row) for row in cur.fetchall()]
 
         # Get Q3 results
         cur.execute("""
-            SELECT log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts
+            SELECT batch_id, log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts
             FROM hourly_errors 
             WHERE run_uuid = %s
-            ORDER BY log_date DESC, log_hour DESC
+            ORDER BY batch_id DESC, log_date DESC, log_hour DESC
             LIMIT 50
         """, (run_uuid,))
         q3 = [dict(row) for row in cur.fetchall()]
@@ -454,6 +548,7 @@ def get_runs():
         cur.execute("""
             SELECT 
                 pipeline, run_uuid, batch_size, batch_mode, batch_interval_seconds,
+                aggregation_mode,
                 total_records, total_batches, avg_batch_size,
                 malformed_count, runtime_seconds, status,
                 started_at, completed_at

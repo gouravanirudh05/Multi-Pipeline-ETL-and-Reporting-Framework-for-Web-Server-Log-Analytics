@@ -165,6 +165,11 @@ async function initializePostgres(pgClient) {
   `);
 
   await pgClient.query(`
+    ALTER TABLE etl_runs
+    ADD COLUMN IF NOT EXISTS aggregation_mode VARCHAR(20) DEFAULT 'global';
+  `);
+
+  await pgClient.query(`
     CREATE TABLE IF NOT EXISTS batch_metadata (
       id SERIAL PRIMARY KEY,
       run_uuid VARCHAR(64),
@@ -283,9 +288,14 @@ async function writeFinalAggregates(
   totalBatches,
   logsCollection,
   pgClient,
-  query
+  query,
+  aggregationMode
 ) {
   const resultBatchId = totalBatches;
+  const batchIds =
+    aggregationMode === "per_batch"
+      ? Array.from({ length: totalBatches }, (_, index) => index + 1)
+      : [resultBatchId];
 
   if (query === "all" || query === "q1") {
     await pgClient.query("DELETE FROM daily_traffic WHERE run_uuid = $1", [
@@ -307,43 +317,54 @@ async function writeFinalAggregates(
   // Query 1: Daily Traffic Summary
   // ----------------------
   if (query === "all" || query === "q1") {
-    console.log("Running Q1 (Daily Traffic) over full run...");
-    const dailySummary = await logsCollection
-      .aggregate(
-      [
-        { $match: { run_uuid: runUuid } },
-        {
-          $group: {
-            _id: {
-              log_date: "$log_date",
-              status_code: "$status_code",
+    console.log(
+      aggregationMode === "per_batch"
+        ? "Running Q1 (Daily Traffic) per batch..."
+        : "Running Q1 (Daily Traffic) over full run..."
+    );
+    for (const batchId of batchIds) {
+      const dailySummary = await logsCollection
+        .aggregate(
+          [
+            {
+              $match:
+                aggregationMode === "per_batch"
+                  ? { run_uuid: runUuid, batch_id: batchId }
+                  : { run_uuid: runUuid },
             },
-            request_count: { $sum: 1 },
-            total_bytes: { $sum: "$bytes_transferred" },
-          },
-        },
-      ],
-      { allowDiskUse: true }
-      )
-      .toArray();
+            {
+              $group: {
+                _id: {
+                  log_date: "$log_date",
+                  status_code: "$status_code",
+                },
+                request_count: { $sum: 1 },
+                total_bytes: { $sum: "$bytes_transferred" },
+              },
+            },
+          ],
+          { allowDiskUse: true }
+        )
+        .toArray();
 
-    for (const row of dailySummary) {
-      await pgClient.query(
-        `
-        INSERT INTO daily_traffic
-        (pipeline, run_uuid, batch_id, log_date, status_code, request_count, total_bytes)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        `,
-        [
-          pipeline,
-          runUuid,
-          resultBatchId,
-          row._id.log_date,
-          row._id.status_code,
-          row.request_count,
-          row.total_bytes,
-        ]
-      );
+      for (const row of dailySummary) {
+        await pgClient.query(
+          `
+          INSERT INTO daily_traffic
+          (pipeline, run_uuid, batch_id, log_date, status_code, request_count, total_bytes)
+          VALUES ($1, $2, $3, $4, $5, $6, $7)
+          `,
+          [
+            pipeline,
+            runUuid,
+            batchId,
+            row._id.log_date,
+            row._id.status_code,
+            row.request_count,
+            row.total_bytes,
+          ]
+        );
+      }
     }
   }
 
@@ -351,51 +372,62 @@ async function writeFinalAggregates(
   // Query 2: Top Requested Resources
   // ----------------------
   if (query === "all" || query === "q2") {
-    console.log("Running Q2 (Top Resources) over full run...");
-    const topResources = await logsCollection
-      .aggregate(
-      [
-        { $match: { run_uuid: runUuid } },
-        {
-          $group: {
-            _id: "$resource_path",
-            request_count: { $sum: 1 },
-            total_bytes: { $sum: "$bytes_transferred" },
-            distinct_hosts: { $addToSet: "$host" },
-          },
-        },
-        {
-          $project: {
-            resource_path: "$_id",
-            request_count: 1,
-            total_bytes: 1,
-            distinct_host_count: { $size: "$distinct_hosts" },
-          },
-        },
-        { $sort: { request_count: -1, resource_path: 1 } },
-        { $limit: 20 },
-      ],
-      { allowDiskUse: true }
-      )
-      .toArray();
+    console.log(
+      aggregationMode === "per_batch"
+        ? "Running Q2 (Top Resources) per batch..."
+        : "Running Q2 (Top Resources) over full run..."
+    );
+    for (const batchId of batchIds) {
+      const topResources = await logsCollection
+        .aggregate(
+          [
+            {
+              $match:
+                aggregationMode === "per_batch"
+                  ? { run_uuid: runUuid, batch_id: batchId }
+                  : { run_uuid: runUuid },
+            },
+            {
+              $group: {
+                _id: "$resource_path",
+                request_count: { $sum: 1 },
+                total_bytes: { $sum: "$bytes_transferred" },
+                distinct_hosts: { $addToSet: "$host" },
+              },
+            },
+            {
+              $project: {
+                resource_path: "$_id",
+                request_count: 1,
+                total_bytes: 1,
+                distinct_host_count: { $size: "$distinct_hosts" },
+              },
+            },
+            { $sort: { request_count: -1, resource_path: 1 } },
+            { $limit: 20 },
+          ],
+          { allowDiskUse: true }
+        )
+        .toArray();
 
-    for (const row of topResources) {
-      await pgClient.query(
-        `
-        INSERT INTO top_resources
-        (pipeline, run_uuid, batch_id, resource_path, request_count, total_bytes, distinct_host_count)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        `,
-        [
-          pipeline,
-          runUuid,
-          resultBatchId,
-          row.resource_path,
-          row.request_count,
-          row.total_bytes,
-          row.distinct_host_count,
-        ]
-      );
+      for (const row of topResources) {
+        await pgClient.query(
+          `
+          INSERT INTO top_resources
+          (pipeline, run_uuid, batch_id, resource_path, request_count, total_bytes, distinct_host_count)
+          VALUES ($1, $2, $3, $4, $5, $6, $7)
+          `,
+          [
+            pipeline,
+            runUuid,
+            batchId,
+            row.resource_path,
+            row.request_count,
+            row.total_bytes,
+            row.distinct_host_count,
+          ]
+        );
+      }
     }
   }
 
@@ -403,92 +435,103 @@ async function writeFinalAggregates(
   // Query 3: Hourly Error Analysis
   // ----------------------
   if (query === "all" || query === "q3") {
-    console.log("Running Q3 (Hourly Errors) over full run...");
-    const hourlyErrors = await logsCollection
-      .aggregate(
-      [
-        { $match: { run_uuid: runUuid } },
-        {
-          $group: {
-            _id: {
-              log_date: "$log_date",
-              log_hour: "$log_hour",
+    console.log(
+      aggregationMode === "per_batch"
+        ? "Running Q3 (Hourly Errors) per batch..."
+        : "Running Q3 (Hourly Errors) over full run..."
+    );
+    for (const batchId of batchIds) {
+      const hourlyErrors = await logsCollection
+        .aggregate(
+          [
+            {
+              $match:
+                aggregationMode === "per_batch"
+                  ? { run_uuid: runUuid, batch_id: batchId }
+                  : { run_uuid: runUuid },
             },
-            total_requests: { $sum: 1 },
-            error_requests: {
-              $sum: {
-                $cond: [
-                  {
-                    $and: [
-                      { $gte: ["$status_code", 400] },
-                      { $lte: ["$status_code", 599] },
-                    ],
-                  },
-                  1,
-                  0,
-                ],
-              },
-            },
-            error_hosts: {
-              $addToSet: {
-                $cond: [
-                  {
-                    $and: [
-                      { $gte: ["$status_code", 400] },
-                      { $lte: ["$status_code", 599] },
-                    ],
-                  },
-                  "$host",
-                  "$$REMOVE",
-                ],
-              },
-            },
-          },
-        },
-        {
-          $project: {
-            log_date: "$_id.log_date",
-            log_hour: "$_id.log_hour",
-            total_requests: 1,
-            error_requests: 1,
-            error_rate: {
-              $cond: [
-                { $eq: ["$total_requests", 0] },
-                0,
-                {
-                  $divide: ["$error_requests", "$total_requests"],
+            {
+              $group: {
+                _id: {
+                  log_date: "$log_date",
+                  log_hour: "$log_hour",
                 },
-              ],
+                total_requests: { $sum: 1 },
+                error_requests: {
+                  $sum: {
+                    $cond: [
+                      {
+                        $and: [
+                          { $gte: ["$status_code", 400] },
+                          { $lte: ["$status_code", 599] },
+                        ],
+                      },
+                      1,
+                      0,
+                    ],
+                  },
+                },
+                error_hosts: {
+                  $addToSet: {
+                    $cond: [
+                      {
+                        $and: [
+                          { $gte: ["$status_code", 400] },
+                          { $lte: ["$status_code", 599] },
+                        ],
+                      },
+                      "$host",
+                      "$$REMOVE",
+                    ],
+                  },
+                },
+              },
             },
-            distinct_error_hosts: {
-              $size: "$error_hosts",
+            {
+              $project: {
+                log_date: "$_id.log_date",
+                log_hour: "$_id.log_hour",
+                total_requests: 1,
+                error_requests: 1,
+                error_rate: {
+                  $cond: [
+                    { $eq: ["$total_requests", 0] },
+                    0,
+                    {
+                      $divide: ["$error_requests", "$total_requests"],
+                    },
+                  ],
+                },
+                distinct_error_hosts: {
+                  $size: "$error_hosts",
+                },
+              },
             },
-          },
-        },
-      ],
-      { allowDiskUse: true }
-      )
-      .toArray();
+          ],
+          { allowDiskUse: true }
+        )
+        .toArray();
 
-    for (const row of hourlyErrors) {
-      await pgClient.query(
-        `
-        INSERT INTO hourly_errors
-        (pipeline, run_uuid, batch_id, log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        `,
-        [
-          pipeline,
-          runUuid,
-          resultBatchId,
-          row.log_date,
-          row.log_hour,
-          row.error_requests,
-          row.total_requests,
-          row.error_rate,
-          row.distinct_error_hosts,
-        ]
-      );
+      for (const row of hourlyErrors) {
+        await pgClient.query(
+          `
+          INSERT INTO hourly_errors
+          (pipeline, run_uuid, batch_id, log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          `,
+          [
+            pipeline,
+            runUuid,
+            batchId,
+            row.log_date,
+            row.log_hour,
+            row.error_requests,
+            row.total_requests,
+            row.error_rate,
+            row.distinct_error_hosts,
+          ]
+        );
+      }
     }
   }
 
@@ -573,7 +616,8 @@ async function runPipeline(
   batchValue,
   runUuid,
   pipeline,
-  query = "all"
+  query = "all",
+  aggregationMode = "global"
 ) {
   const startTime = Date.now();
   const isTimeBatching = batchMode === "time";
@@ -603,13 +647,14 @@ async function runPipeline(
   await pgClient.query(
     `
     INSERT INTO etl_runs
-      (run_uuid, pipeline, batch_size, batch_mode, batch_interval_seconds, status, started_at)
-    VALUES ($1, $2, $3, $4, $5, $6, NOW())
+      (run_uuid, pipeline, batch_size, batch_mode, batch_interval_seconds, aggregation_mode, status, started_at)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
     ON CONFLICT (run_uuid) DO UPDATE
     SET pipeline = EXCLUDED.pipeline,
         batch_size = EXCLUDED.batch_size,
         batch_mode = EXCLUDED.batch_mode,
         batch_interval_seconds = EXCLUDED.batch_interval_seconds,
+        aggregation_mode = EXCLUDED.aggregation_mode,
         status = EXCLUDED.status
     `,
     [
@@ -618,6 +663,7 @@ async function runPipeline(
       isTimeBatching ? null : batchValue,
       batchMode,
       isTimeBatching ? batchValue : null,
+      aggregationMode,
       "running",
     ]
   );
@@ -721,7 +767,8 @@ async function runPipeline(
     totalBatches,
     logsCollection,
     pgClient,
-    query
+    query,
+    aggregationMode
   );
 
   const runtimeSeconds = (Date.now() - startTime) / 1000;
@@ -740,8 +787,9 @@ async function runPipeline(
         status = $6,
         completed_at = NOW(),
         batch_mode = $7,
-        batch_interval_seconds = $8
-    WHERE run_uuid = $9
+        batch_interval_seconds = $8,
+        aggregation_mode = $9
+    WHERE run_uuid = $10
     `,
     [
       totalRecords,
@@ -752,6 +800,7 @@ async function runPipeline(
       "completed",
       batchMode,
       isTimeBatching ? batchValue : null,
+      aggregationMode,
       runUuid,
     ]
   );
@@ -791,12 +840,13 @@ let batchMode;
 let batchValue;
 let runUuid;
 let query = "all";
+let aggregationMode = "global";
 
 if (args.length === 3) {
   [logFilePathArg, batchValue, runUuid] = args;
   batchMode = "records";
 } else {
-  [logFilePathArg, batchMode, batchValue, runUuid, query = "all"] = args;
+  [logFilePathArg, batchMode, batchValue, runUuid, query = "all", aggregationMode = "global"] = args;
 }
 
 if (!["records", "time"].includes(batchMode)) {
@@ -805,6 +855,10 @@ if (!["records", "time"].includes(batchMode)) {
 }
 if (!["all", "q1", "q2", "q3"].includes(query)) {
   console.error("query must be one of: all, q1, q2, q3");
+  process.exit(1);
+}
+if (!["global", "per_batch"].includes(aggregationMode)) {
+  console.error("aggregation_mode must be one of: global, per_batch");
   process.exit(1);
 }
 
@@ -823,7 +877,8 @@ runPipeline(
   parsedBatchValue,
   runUuid,
   pipeline,
-  query
+  query,
+  aggregationMode
 ).catch(
   (err) => {
     console.error("Pipeline failed:", err);

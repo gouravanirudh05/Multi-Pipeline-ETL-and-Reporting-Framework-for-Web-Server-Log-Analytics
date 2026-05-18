@@ -90,6 +90,16 @@ public class NasaLogMapReduce extends Configured implements Tool {
         }
     }
 
+    static final class BatchAssignedLog {
+        long batchId;
+        String host;
+        String logDate;
+        int logHour;
+        String resourcePath;
+        int statusCode;
+        long bytesTransferred;
+    }
+
     static ParsedLog parseLogLine(String line) {
         if (line == null || line.trim().isEmpty()) {
             return null;
@@ -147,6 +157,29 @@ public class NasaLogMapReduce extends Configured implements Tool {
                 .of(year, month, day, hour, minute, second)
                 .toInstant(offset)
                 .getEpochSecond();
+            return parsed;
+        } catch (RuntimeException ex) {
+            return null;
+        }
+    }
+
+    static BatchAssignedLog parseBatchAssignedLog(String line) {
+        if (line == null || !line.startsWith("V|")) {
+            return null;
+        }
+        String[] parts = line.split("\\t", -1);
+        if (parts.length < 7) {
+            return null;
+        }
+        try {
+            BatchAssignedLog parsed = new BatchAssignedLog();
+            parsed.batchId = Long.parseLong(parts[0].substring(2));
+            parsed.host = parts[1];
+            parsed.logDate = parts[2];
+            parsed.logHour = Integer.parseInt(parts[3]);
+            parsed.resourcePath = parts[4];
+            parsed.statusCode = Integer.parseInt(parts[5]);
+            parsed.bytesTransferred = Long.parseLong(parts[6]);
             return parsed;
         } catch (RuntimeException ex) {
             return null;
@@ -284,6 +317,18 @@ public class NasaLogMapReduce extends Configured implements Tool {
                 if (parsed == null) {
                     stat.malformedCount++;
                     context.write(new Text("M|" + batchId), new Text(line + "\tparse_failed"));
+                } else {
+                    context.write(
+                        new Text("V|" + batchId),
+                        new Text(
+                            parsed.host + "\t"
+                                + parsed.logDate + "\t"
+                                + parsed.logHour + "\t"
+                                + parsed.resourcePath + "\t"
+                                + parsed.statusCode + "\t"
+                                + parsed.bytesTransferred
+                        )
+                    );
                 }
             }
         }
@@ -300,15 +345,25 @@ public class NasaLogMapReduce extends Configured implements Tool {
     }
 
     public static class DailyTrafficMapper extends Mapper<LongWritable, Text, Text, Text> {
+        private String aggregationMode;
+        private long resultBatchId;
+
+        @Override
+        protected void setup(Context context) {
+            aggregationMode = context.getConfiguration().get("nasa.aggregation.mode", "global");
+            resultBatchId = context.getConfiguration().getLong("nasa.result.batch.id", 0L);
+        }
+
         @Override
         protected void map(LongWritable key, Text value, Context context)
                 throws IOException, InterruptedException {
-            ParsedLog parsed = parseLogLine(value.toString());
+            BatchAssignedLog parsed = parseBatchAssignedLog(value.toString());
             if (parsed == null) {
                 return;
             }
+            long batchId = "per_batch".equals(aggregationMode) ? parsed.batchId : resultBatchId;
             context.write(
-                new Text(parsed.logDate + "|" + parsed.statusCode),
+                new Text(batchId + "|" + parsed.logDate + "|" + parsed.statusCode),
                 new Text("1\t" + parsed.bytesTransferred)
             );
         }
@@ -330,35 +385,36 @@ public class NasaLogMapReduce extends Configured implements Tool {
     }
 
     public static class TopResourcesMapper extends Mapper<LongWritable, Text, Text, Text> {
+        private String aggregationMode;
+        private long resultBatchId;
+
+        @Override
+        protected void setup(Context context) {
+            aggregationMode = context.getConfiguration().get("nasa.aggregation.mode", "global");
+            resultBatchId = context.getConfiguration().getLong("nasa.result.batch.id", 0L);
+        }
+
         @Override
         protected void map(LongWritable key, Text value, Context context)
                 throws IOException, InterruptedException {
-            ParsedLog parsed = parseLogLine(value.toString());
+            BatchAssignedLog parsed = parseBatchAssignedLog(value.toString());
             if (parsed == null) {
                 return;
             }
+            long batchId = "per_batch".equals(aggregationMode) ? parsed.batchId : resultBatchId;
             context.write(
-                new Text(parsed.resourcePath),
+                new Text(batchId + "|" + parsed.resourcePath),
                 new Text(parsed.bytesTransferred + "\t" + parsed.host)
             );
         }
     }
 
     public static class TopResourcesReducer extends Reducer<Text, Text, Text, Text> {
-        private PriorityQueue<ResourceMetric> topResources;
+        private Map<Long, PriorityQueue<ResourceMetric>> topResourcesByBatch;
 
         @Override
         protected void setup(Context context) {
-            topResources = new PriorityQueue<ResourceMetric>(21, new Comparator<ResourceMetric>() {
-                @Override
-                public int compare(ResourceMetric left, ResourceMetric right) {
-                    int byCount = Long.compare(left.requestCount, right.requestCount);
-                    if (byCount != 0) {
-                        return byCount;
-                    }
-                    return right.resourcePath.compareTo(left.resourcePath);
-                }
-            });
+            topResourcesByBatch = new TreeMap<Long, PriorityQueue<ResourceMetric>>();
         }
 
         @Override
@@ -374,9 +430,22 @@ public class NasaLogMapReduce extends Configured implements Tool {
                 hosts.add(parts[1]);
             }
 
-            topResources.offer(
-                new ResourceMetric(key.toString(), requestCount, totalBytes, hosts.size())
-            );
+            ResourceMetric row = new ResourceMetric(key.toString(), requestCount, totalBytes, hosts.size());
+            PriorityQueue<ResourceMetric> topResources = topResourcesByBatch.get(row.batchId);
+            if (topResources == null) {
+                topResources = new PriorityQueue<ResourceMetric>(21, new Comparator<ResourceMetric>() {
+                    @Override
+                    public int compare(ResourceMetric left, ResourceMetric right) {
+                        int byCount = Long.compare(left.requestCount, right.requestCount);
+                        if (byCount != 0) {
+                            return byCount;
+                        }
+                        return right.resourcePath.compareTo(left.resourcePath);
+                    }
+                });
+                topResourcesByBatch.put(row.batchId, topResources);
+            }
+            topResources.offer(row);
             if (topResources.size() > 20) {
                 topResources.poll();
             }
@@ -384,35 +453,40 @@ public class NasaLogMapReduce extends Configured implements Tool {
 
         @Override
         protected void cleanup(Context context) throws IOException, InterruptedException {
-            List<ResourceMetric> rows = new ArrayList<ResourceMetric>(topResources);
-            Collections.sort(rows, new Comparator<ResourceMetric>() {
-                @Override
-                public int compare(ResourceMetric left, ResourceMetric right) {
-                    int byCount = Long.compare(right.requestCount, left.requestCount);
-                    if (byCount != 0) {
-                        return byCount;
+            for (Map.Entry<Long, PriorityQueue<ResourceMetric>> entry : topResourcesByBatch.entrySet()) {
+                List<ResourceMetric> rows = new ArrayList<ResourceMetric>(entry.getValue());
+                Collections.sort(rows, new Comparator<ResourceMetric>() {
+                    @Override
+                    public int compare(ResourceMetric left, ResourceMetric right) {
+                        int byCount = Long.compare(right.requestCount, left.requestCount);
+                        if (byCount != 0) {
+                            return byCount;
+                        }
+                        return left.resourcePath.compareTo(right.resourcePath);
                     }
-                    return left.resourcePath.compareTo(right.resourcePath);
-                }
-            });
+                });
 
-            for (ResourceMetric row : rows) {
-                context.write(
-                    new Text(row.resourcePath),
-                    new Text(row.requestCount + "\t" + row.totalBytes + "\t" + row.distinctHostCount)
-                );
+                for (ResourceMetric row : rows) {
+                    context.write(
+                        new Text(row.batchId + "|" + row.resourcePath),
+                        new Text(row.requestCount + "\t" + row.totalBytes + "\t" + row.distinctHostCount)
+                    );
+                }
             }
         }
     }
 
     static final class ResourceMetric {
+        final long batchId;
         final String resourcePath;
         final long requestCount;
         final long totalBytes;
         final int distinctHostCount;
 
-        ResourceMetric(String resourcePath, long requestCount, long totalBytes, int distinctHostCount) {
-            this.resourcePath = resourcePath;
+        ResourceMetric(String compositeKey, long requestCount, long totalBytes, int distinctHostCount) {
+            String[] keyParts = compositeKey.split("\\|", 2);
+            this.batchId = Long.parseLong(keyParts[0]);
+            this.resourcePath = keyParts.length > 1 ? keyParts[1] : compositeKey;
             this.requestCount = requestCount;
             this.totalBytes = totalBytes;
             this.distinctHostCount = distinctHostCount;
@@ -420,16 +494,26 @@ public class NasaLogMapReduce extends Configured implements Tool {
     }
 
     public static class HourlyErrorsMapper extends Mapper<LongWritable, Text, Text, Text> {
+        private String aggregationMode;
+        private long resultBatchId;
+
+        @Override
+        protected void setup(Context context) {
+            aggregationMode = context.getConfiguration().get("nasa.aggregation.mode", "global");
+            resultBatchId = context.getConfiguration().getLong("nasa.result.batch.id", 0L);
+        }
+
         @Override
         protected void map(LongWritable key, Text value, Context context)
                 throws IOException, InterruptedException {
-            ParsedLog parsed = parseLogLine(value.toString());
+            BatchAssignedLog parsed = parseBatchAssignedLog(value.toString());
             if (parsed == null) {
                 return;
             }
             boolean isError = parsed.statusCode >= 400 && parsed.statusCode <= 599;
+            long batchId = "per_batch".equals(aggregationMode) ? parsed.batchId : resultBatchId;
             context.write(
-                new Text(parsed.logDate + "|" + parsed.logHour),
+                new Text(batchId + "|" + parsed.logDate + "|" + parsed.logHour),
                 new Text((isError ? "1" : "0") + "\t" + (isError ? parsed.host : ""))
             );
         }
@@ -477,6 +561,7 @@ public class NasaLogMapReduce extends Configured implements Tool {
         int batchValue = Integer.parseInt(args[2]);
         String runUuid = args[3];
         String query = args.length >= 5 ? args[4] : "all";
+        String aggregationMode = args.length >= 6 ? args[5] : "global";
 
         getConf().set("mapreduce.framework.name", "local");
 
@@ -488,6 +573,9 @@ public class NasaLogMapReduce extends Configured implements Tool {
         }
         if (!"all".equals(query) && !"q1".equals(query) && !"q2".equals(query) && !"q3".equals(query)) {
             throw new IllegalArgumentException("query must be one of all, q1, q2, q3");
+        }
+        if (!"global".equals(aggregationMode) && !"per_batch".equals(aggregationMode)) {
+            throw new IllegalArgumentException("aggregation_mode must be one of: global, per_batch");
         }
 
         long startMillis = System.currentTimeMillis();
@@ -507,6 +595,7 @@ public class NasaLogMapReduce extends Configured implements Tool {
         metadataJob.setMapOutputValueClass(LongWritable.class);
         metadataJob.setOutputKeyClass(Text.class);
         metadataJob.setOutputValueClass(LongWritable.class);
+        metadataJob.setCombinerClass(MinEpochReducer.class);
         addInputs(metadataJob, inputPaths);
         if (!metadataJob.waitForCompletion(true)) {
             throw new IllegalStateException("Metadata MapReduce job failed");
@@ -549,11 +638,14 @@ public class NasaLogMapReduce extends Configured implements Tool {
         if ("all".equals(query) || "q1".equals(query)) {
             q1Output = new Path(baseOutput, "q1_daily_traffic");
             Job q1Job = createJob("nasa-q1-daily-traffic", DailyTrafficMapper.class, DailyTrafficReducer.class, q1Output);
+            q1Job.getConfiguration().set("nasa.aggregation.mode", aggregationMode);
+            q1Job.getConfiguration().setLong("nasa.result.batch.id", totalBatches);
             q1Job.setMapOutputKeyClass(Text.class);
             q1Job.setMapOutputValueClass(Text.class);
             q1Job.setOutputKeyClass(Text.class);
             q1Job.setOutputValueClass(Text.class);
-            addInputs(q1Job, inputPaths);
+            q1Job.setCombinerClass(DailyTrafficReducer.class);
+            FileInputFormat.addInputPath(q1Job, batchMetadataOutput);
             if (!q1Job.waitForCompletion(true)) {
                 throw new IllegalStateException("Q1 MapReduce job failed");
             }
@@ -563,12 +655,14 @@ public class NasaLogMapReduce extends Configured implements Tool {
         if ("all".equals(query) || "q2".equals(query)) {
             q2Output = new Path(baseOutput, "q2_top_resources");
             Job q2Job = createJob("nasa-q2-top-resources", TopResourcesMapper.class, TopResourcesReducer.class, q2Output);
+            q2Job.getConfiguration().set("nasa.aggregation.mode", aggregationMode);
+            q2Job.getConfiguration().setLong("nasa.result.batch.id", totalBatches);
             q2Job.setMapOutputKeyClass(Text.class);
             q2Job.setMapOutputValueClass(Text.class);
             q2Job.setOutputKeyClass(Text.class);
             q2Job.setOutputValueClass(Text.class);
             q2Job.setNumReduceTasks(1);
-            addInputs(q2Job, inputPaths);
+            FileInputFormat.addInputPath(q2Job, batchMetadataOutput);
             if (!q2Job.waitForCompletion(true)) {
                 throw new IllegalStateException("Q2 MapReduce job failed");
             }
@@ -578,11 +672,13 @@ public class NasaLogMapReduce extends Configured implements Tool {
         if ("all".equals(query) || "q3".equals(query)) {
             q3Output = new Path(baseOutput, "q3_hourly_errors");
             Job q3Job = createJob("nasa-q3-hourly-errors", HourlyErrorsMapper.class, HourlyErrorsReducer.class, q3Output);
+            q3Job.getConfiguration().set("nasa.aggregation.mode", aggregationMode);
+            q3Job.getConfiguration().setLong("nasa.result.batch.id", totalBatches);
             q3Job.setMapOutputKeyClass(Text.class);
             q3Job.setMapOutputValueClass(Text.class);
             q3Job.setOutputKeyClass(Text.class);
             q3Job.setOutputValueClass(Text.class);
-            addInputs(q3Job, inputPaths);
+            FileInputFormat.addInputPath(q3Job, batchMetadataOutput);
             if (!q3Job.waitForCompletion(true)) {
                 throw new IllegalStateException("Q3 MapReduce job failed");
             }
@@ -603,6 +699,7 @@ public class NasaLogMapReduce extends Configured implements Tool {
             malformedRecords,
             runtimeSeconds,
             batchStats,
+            aggregationMode,
             q1Output,
             q2Output,
             q3Output
@@ -677,22 +774,24 @@ public class NasaLogMapReduce extends Configured implements Tool {
 
     private void loadPostgres(String runUuid, String batchMode, int batchValue,
             long totalRecords, long totalBatches, double avgBatchSize, long malformedRecords,
-            double runtimeSeconds, List<BatchStat> batchStats,
+            double runtimeSeconds, List<BatchStat> batchStats, String aggregationMode,
             Path q1Output, Path q2Output, Path q3Output) throws Exception {
         StringBuilder sql = new StringBuilder();
         sql.append(schemaSql());
         sql.append("INSERT INTO etl_runs ")
-            .append("(run_uuid, pipeline, batch_size, batch_mode, batch_interval_seconds, status, started_at) VALUES (")
+            .append("(run_uuid, pipeline, batch_size, batch_mode, batch_interval_seconds, aggregation_mode, status, started_at) VALUES (")
             .append(sqlString(runUuid)).append(", ")
             .append("'mapreduce', ")
             .append("records".equals(batchMode) ? String.valueOf(batchValue) : "NULL").append(", ")
             .append(sqlString(batchMode)).append(", ")
             .append("time".equals(batchMode) ? String.valueOf(batchValue) : "NULL").append(", ")
+            .append(sqlString(aggregationMode)).append(", ")
             .append("'running', NOW()) ")
             .append("ON CONFLICT (run_uuid) DO UPDATE SET ")
             .append("pipeline = EXCLUDED.pipeline, ")
             .append("batch_size = EXCLUDED.batch_size, ")
             .append("batch_mode = EXCLUDED.batch_mode, ")
+            .append("aggregation_mode = EXCLUDED.aggregation_mode, ")
             .append("batch_interval_seconds = EXCLUDED.batch_interval_seconds, ")
             .append("status = EXCLUDED.status;\n");
         sql.append("DELETE FROM daily_traffic WHERE run_uuid = ").append(sqlString(runUuid)).append(";\n");
@@ -704,13 +803,13 @@ public class NasaLogMapReduce extends Configured implements Tool {
 
         appendBatchMetadata(sql, runUuid, batchValue, batchStats, malformedRecords);
         if (q1Output != null) {
-            appendQ1Inserts(sql, runUuid, totalBatches, q1Output);
+            appendQ1Inserts(sql, runUuid, totalBatches, aggregationMode, q1Output);
         }
         if (q2Output != null) {
-            appendQ2Inserts(sql, runUuid, totalBatches, q2Output);
+            appendQ2Inserts(sql, runUuid, totalBatches, aggregationMode, q2Output);
         }
         if (q3Output != null) {
-            appendQ3Inserts(sql, runUuid, totalBatches, q3Output);
+            appendQ3Inserts(sql, runUuid, totalBatches, aggregationMode, q3Output);
         }
 
         sql.append("UPDATE etl_runs SET ")
@@ -722,6 +821,7 @@ public class NasaLogMapReduce extends Configured implements Tool {
             .append("status = 'completed', ")
             .append("completed_at = NOW(), ")
             .append("batch_mode = ").append(sqlString(batchMode)).append(", ")
+            .append("aggregation_mode = ").append(sqlString(aggregationMode)).append(", ")
             .append("batch_interval_seconds = ")
             .append("time".equals(batchMode) ? String.valueOf(batchValue) : "NULL")
             .append(" WHERE run_uuid = ").append(sqlString(runUuid)).append(";\n");
@@ -762,7 +862,7 @@ public class NasaLogMapReduce extends Configured implements Tool {
         }
     }
 
-    private void appendQ1Inserts(StringBuilder sql, String runUuid, long batchId, Path outputPath)
+    private void appendQ1Inserts(StringBuilder sql, String runUuid, long batchId, String aggregationMode, Path outputPath)
             throws IOException {
         for (String line : readPartLines(outputPath)) {
             String[] parts = line.split("\\t", -1);
@@ -770,41 +870,47 @@ public class NasaLogMapReduce extends Configured implements Tool {
                 continue;
             }
             String[] keyParts = parts[0].split("\\|", -1);
-            if (keyParts.length < 2) {
+            if (keyParts.length < 3) {
                 continue;
             }
+            long resultBatchId = "per_batch".equals(aggregationMode) ? Long.parseLong(keyParts[0]) : batchId;
             sql.append("INSERT INTO daily_traffic ")
                 .append("(pipeline, run_uuid, batch_id, log_date, status_code, request_count, total_bytes) VALUES (")
                 .append("'mapreduce', ")
                 .append(sqlString(runUuid)).append(", ")
-                .append(batchId).append(", ")
-                .append(sqlString(keyParts[0])).append(", ")
-                .append(keyParts[1]).append(", ")
+                .append(resultBatchId).append(", ")
+                .append(sqlString(keyParts[1])).append(", ")
+                .append(keyParts[2]).append(", ")
                 .append(parts[1]).append(", ")
                 .append(parts[2]).append(");\n");
         }
     }
 
-    private void appendQ2Inserts(StringBuilder sql, String runUuid, long batchId, Path outputPath)
+    private void appendQ2Inserts(StringBuilder sql, String runUuid, long batchId, String aggregationMode, Path outputPath)
             throws IOException {
         for (String line : readPartLines(outputPath)) {
             String[] parts = line.split("\\t", -1);
             if (parts.length < 4) {
                 continue;
             }
+            String[] keyParts = parts[0].split("\\|", -1);
+            if (keyParts.length < 2) {
+                continue;
+            }
+            long resultBatchId = "per_batch".equals(aggregationMode) ? Long.parseLong(keyParts[0]) : batchId;
             sql.append("INSERT INTO top_resources ")
                 .append("(pipeline, run_uuid, batch_id, resource_path, request_count, total_bytes, distinct_host_count) VALUES (")
                 .append("'mapreduce', ")
                 .append(sqlString(runUuid)).append(", ")
-                .append(batchId).append(", ")
-                .append(sqlString(parts[0])).append(", ")
+                .append(resultBatchId).append(", ")
+                .append(sqlString(keyParts[1])).append(", ")
                 .append(parts[1]).append(", ")
                 .append(parts[2]).append(", ")
                 .append(parts[3]).append(");\n");
         }
     }
 
-    private void appendQ3Inserts(StringBuilder sql, String runUuid, long batchId, Path outputPath)
+    private void appendQ3Inserts(StringBuilder sql, String runUuid, long batchId, String aggregationMode, Path outputPath)
             throws IOException {
         for (String line : readPartLines(outputPath)) {
             String[] parts = line.split("\\t", -1);
@@ -812,16 +918,17 @@ public class NasaLogMapReduce extends Configured implements Tool {
                 continue;
             }
             String[] keyParts = parts[0].split("\\|", -1);
-            if (keyParts.length < 2) {
+            if (keyParts.length < 3) {
                 continue;
             }
+            long resultBatchId = "per_batch".equals(aggregationMode) ? Long.parseLong(keyParts[0]) : batchId;
             sql.append("INSERT INTO hourly_errors ")
                 .append("(pipeline, run_uuid, batch_id, log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts) VALUES (")
                 .append("'mapreduce', ")
                 .append(sqlString(runUuid)).append(", ")
-                .append(batchId).append(", ")
-                .append(sqlString(keyParts[0])).append(", ")
-                .append(keyParts[1]).append(", ")
+                .append(resultBatchId).append(", ")
+                .append(sqlString(keyParts[1])).append(", ")
+                .append(keyParts[2]).append(", ")
                 .append(parts[1]).append(", ")
                 .append(parts[2]).append(", ")
                 .append(parts[3]).append(", ")
@@ -874,6 +981,7 @@ public class NasaLogMapReduce extends Configured implements Tool {
             + ");\n"
             + "ALTER TABLE etl_runs ADD COLUMN IF NOT EXISTS batch_mode VARCHAR(20) DEFAULT 'records';\n"
             + "ALTER TABLE etl_runs ADD COLUMN IF NOT EXISTS batch_interval_seconds INTEGER;\n"
+            + "ALTER TABLE etl_runs ADD COLUMN IF NOT EXISTS aggregation_mode VARCHAR(20) DEFAULT 'global';\n"
             + "CREATE TABLE IF NOT EXISTS batch_metadata ("
             + "id SERIAL PRIMARY KEY, run_uuid VARCHAR(64), pipeline VARCHAR(20), batch_id INTEGER, "
             + "batch_size INTEGER, records_processed INTEGER, malformed_count INTEGER DEFAULT 0, "
