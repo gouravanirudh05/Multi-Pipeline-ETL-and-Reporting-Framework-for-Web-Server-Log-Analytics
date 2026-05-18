@@ -572,19 +572,11 @@
           </select>
         </div>
         <div class="form-group">
-          <label class="form-label">Batching mode</label>
-          <div class="segmented">
-            <button type="button" id="batch-records-btn" class="active" onclick="setBatchMode('records')">Records</button>
-            <button type="button" id="batch-time-btn" onclick="setBatchMode('time')">Time window</button>
-          </div>
-        </div>
-        <div class="form-group" id="record-batch-group">
-          <label class="form-label">Batch size (records per batch)</label>
-          <input id="batch-size" type="number" class="form-input" value="10000" min="1" max="1000000"/>
-        </div>
-        <div class="form-group" id="time-batch-group" style="display:none;">
-          <label class="form-label">Time window (minutes per batch)</label>
-          <input id="batch-minutes" type="number" class="form-input" value="60" min="1" max="43200"/>
+          <label class="form-label">Time window batching</label>
+          <select id="batch-interval" class="form-input">
+            <option value="604800">1 Week</option>
+            <option value="2592000">1 Month</option>
+          </select>
         </div>
       </div>
     </div>
@@ -760,7 +752,7 @@ const API = "http://localhost:5050";
 let selectedPipeline = null;
 let isRunning = false;
 let logCount = 0;
-let batchMode = "records";
+let batchMode = "time";
 
 // ── Pipeline Selection ─────────────────────────────────────────────────────
 function selectPipeline(card) {
@@ -779,13 +771,7 @@ function selectPipeline(card) {
   btn.textContent = labels[selectedPipeline] || "Run Pipeline";
 }
 
-function setBatchMode(mode) {
-  batchMode = mode === "time" ? "time" : "records";
-  document.getElementById("batch-records-btn").classList.toggle("active", batchMode === "records");
-  document.getElementById("batch-time-btn").classList.toggle("active", batchMode === "time");
-  document.getElementById("record-batch-group").style.display = batchMode === "records" ? "flex" : "none";
-  document.getElementById("time-batch-group").style.display = batchMode === "time" ? "flex" : "none";
-}
+
 
 // ── Tab Switching ──────────────────────────────────────────────────────────
 function switchTab(name, btn) {
@@ -842,9 +828,7 @@ async function triggerRun() {
   if (isRunning || !selectedPipeline) return;
 
   const filesRaw  = document.getElementById("log-files").value.trim();
-  const batchSize = parseInt(document.getElementById("batch-size").value) || 10000;
-  const batchMinutes = parseInt(document.getElementById("batch-minutes").value) || 60;
-  const batchIntervalSeconds = batchMinutes * 60;
+  const batchIntervalSeconds = parseInt(document.getElementById("batch-interval").value) || 604800;
   const query = document.getElementById("query-select").value || "all";
   const aggregationMode = document.getElementById("aggregation-mode").value || "global";
   const logFiles  = filesRaw.split("\n").map(s => s.trim()).filter(Boolean);
@@ -859,9 +843,8 @@ async function triggerRun() {
   const btn = document.getElementById("run-btn");
   btn.disabled = true;
   btn.textContent = "Running...";
-  const batchLabel = batchMode === "time"
-    ? `time_window=${batchMinutes.toLocaleString()} min`
-    : `batch_size=${batchSize.toLocaleString()}`;
+  const intervalDays = batchIntervalSeconds / 86400;
+  const batchLabel = `time_window=${intervalDays} days`;
   document.getElementById("terminal-title").textContent =
     `[${selectedPipeline.toUpperCase()}]  ${batchLabel}`;
 
@@ -871,8 +854,8 @@ async function triggerRun() {
   appendLog(`  Files: ${logFiles.join(", ")}`, "info");
   appendLog(`  Query: ${query}`, "info");
   appendLog(`  Aggregation: ${aggregationMode}`, "info");
-  appendLog(`  Batch mode: ${batchMode}`, "info");
-  appendLog(`  ${batchMode === "time" ? "Time window" : "Batch size"}: ${batchMode === "time" ? batchMinutes.toLocaleString() + " min" : batchSize.toLocaleString()}`, "info");
+  appendLog(`  Batch mode: time`, "info");
+  appendLog(`  Time window: ${intervalDays} days`, "info");
   appendLog("-".repeat(60), "info");
 
   const iv = animateProgress();
@@ -886,7 +869,6 @@ async function triggerRun() {
         batch_mode: batchMode,
         aggregation_mode: aggregationMode,
         query,
-        batch_size: batchSize, 
         batch_interval_seconds: batchIntervalSeconds,
         log_files: logFiles 
       })

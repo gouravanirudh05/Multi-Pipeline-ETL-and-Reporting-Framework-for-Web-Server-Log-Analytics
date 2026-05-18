@@ -273,27 +273,25 @@ def status():
 async def run_pipeline(req: Request):
     body = await req.json()
     pipeline = body.get("pipeline")
-    batch_mode = body.get("batch_mode", "records")
+    batch_mode = body.get("batch_mode", "time")
     aggregation_mode = body.get("aggregation_mode", "global")
-    batch_size = int(body.get("batch_size", 10000) or 10000)
-    batch_interval_seconds = int(body.get("batch_interval_seconds", 3600) or 3600)
+    batch_interval_seconds = int(body.get("batch_interval_seconds", 604800) or 604800)
     query = body.get("query", "all")
     log_files = body.get("log_files", [])
 
     if not pipeline or not log_files:
         return {"error": "Missing pipeline or log_files"}
-    if batch_mode not in {"records", "time"}:
-        return {"error": "batch_mode must be 'records' or 'time'"}
+    if batch_mode != "time":
+        return {"error": "batch_mode must be 'time'"}
     if aggregation_mode not in {"global", "per_batch"}:
         return {"error": "aggregation_mode must be 'global' or 'per_batch'"}
-    if batch_size <= 0:
-        return {"error": "batch_size must be greater than 0"}
-    if batch_interval_seconds <= 0:
-        return {"error": "batch_interval_seconds must be greater than 0"}
+    if batch_interval_seconds not in {604800, 2592000}:
+        return {"error": "batch_interval_seconds must be exactly 604800 (week) or 2592000 (month)"}
     if query not in {"all", "q1", "q2", "q3"}:
         return {"error": "query must be one of: all, q1, q2, q3"}
 
-    batch_value = batch_interval_seconds if batch_mode == "time" else batch_size
+    batch_value = batch_interval_seconds
+    batch_size = None
 
     # Generate UUID for this run
     run_uuid = str(uuid_lib.uuid4())

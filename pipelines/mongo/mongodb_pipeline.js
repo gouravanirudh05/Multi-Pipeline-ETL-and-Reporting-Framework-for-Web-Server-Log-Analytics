@@ -10,6 +10,7 @@ import fs from "fs";
 import readline from "readline";
 import { MongoClient } from "mongodb";
 import pg from "pg";
+import zlib from "zlib";
 
 const { Client } = pg;
 
@@ -694,8 +695,13 @@ async function runPipeline(
       throw new Error(`Log file not found: ${logFilePath}`);
     }
 
+    let fileStream = fs.createReadStream(logFilePath);
+    if (logFilePath.endsWith('.gz')) {
+      fileStream = fileStream.pipe(zlib.createGunzip());
+    }
+
     const rl = readline.createInterface({
-      input: fs.createReadStream(logFilePath),
+      input: fileStream,
       crlfDelay: Infinity,
     });
 

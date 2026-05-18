@@ -19,6 +19,7 @@ RUN apt-get update \
         bash \
         ca-certificates \
         curl \
+        dos2unix \
         netcat-openbsd \
         nodejs \
         npm \
@@ -30,17 +31,17 @@ RUN apt-get update \
         wget \
     && rm -rf /var/lib/apt/lists/*
 
-RUN wget -q "https://archive.apache.org/dist/hadoop/common/hadoop-${HADOOP_VERSION}/hadoop-${HADOOP_VERSION}.tar.gz" -O /tmp/hadoop.tar.gz \
+RUN wget "https://dlcdn.apache.org/hadoop/common/hadoop-${HADOOP_VERSION}/hadoop-${HADOOP_VERSION}.tar.gz" -O /tmp/hadoop.tar.gz \
     && tar -xzf /tmp/hadoop.tar.gz -C /opt \
     && mv "/opt/hadoop-${HADOOP_VERSION}" "$HADOOP_HOME" \
     && rm /tmp/hadoop.tar.gz
 
-RUN wget -q "https://archive.apache.org/dist/pig/pig-${PIG_VERSION}/pig-${PIG_VERSION}.tar.gz" -O /tmp/pig.tar.gz \
+RUN wget "https://dlcdn.apache.org/pig/pig-${PIG_VERSION}/pig-${PIG_VERSION}.tar.gz" -O /tmp/pig.tar.gz \
     && tar -xzf /tmp/pig.tar.gz -C /opt \
     && mv "/opt/pig-${PIG_VERSION}" "$PIG_HOME" \
     && rm /tmp/pig.tar.gz
 
-RUN wget -q "https://archive.apache.org/dist/hive/hive-${HIVE_VERSION}/apache-hive-${HIVE_VERSION}-bin.tar.gz" -O /tmp/hive.tar.gz \
+RUN wget "https://archive.apache.org/dist/hive/hive-${HIVE_VERSION}/apache-hive-${HIVE_VERSION}-bin.tar.gz" -O /tmp/hive.tar.gz \
     && tar -xzf /tmp/hive.tar.gz -C /opt \
     && mv "/opt/apache-hive-${HIVE_VERSION}-bin" "$HIVE_HOME" \
     && rm /tmp/hive.tar.gz
@@ -61,7 +62,8 @@ COPY docker/hadoop/mapred-site.xml "$HADOOP_CONF_DIR/mapred-site.xml"
 COPY docker/hive/hive-site.xml "$HIVE_CONF_DIR/hive-site.xml"
 COPY docker/entrypoint.sh /usr/local/bin/nosql-etl-entrypoint
 
-RUN chmod +x /usr/local/bin/nosql-etl-entrypoint \
+RUN dos2unix /usr/local/bin/nosql-etl-entrypoint pig/run.sh pipelines/hive/run.sh pipelines/mapreduce/run.sh scripts/load_tsv_to_postgres.sh \
+    && chmod +x /usr/local/bin/nosql-etl-entrypoint \
     && chmod +x pig/run.sh pipelines/hive/run.sh pipelines/mapreduce/run.sh scripts/load_tsv_to_postgres.sh \
     && mkdir -p /hadoop-data/dfs/name /hadoop-data/dfs/data /app/.hive/warehouse /app/.hive/scratch /app/.hive/tmp /app/data
 
