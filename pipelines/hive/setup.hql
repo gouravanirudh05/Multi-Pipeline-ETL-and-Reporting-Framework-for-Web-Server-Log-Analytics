@@ -89,29 +89,30 @@ FROM normalized;
 CREATE TABLE valid_epoch AS
 SELECT
   min(unix_timestamp(concat(year_text, '-', month_num, '-', day_text, ' ', hour_text, ':', minute_text, ':', second_text), 'yyyy-MM-dd HH:mm:ss')) AS min_epoch,
-  min(cast(year_text as int)) AS min_year,
-  min(cast(month_num as int)) AS min_month
+  min(cast(year_text as int) * 12 + cast(month_num as int)) AS min_year_month
 FROM normalized_validated
 WHERE is_valid = 1;
 
 CREATE TABLE annotated_logs AS
 SELECT
   n.*,
-  CASE
-    WHEN '${hivevar:BATCH_MODE}' = 'time' THEN
-      CASE
-        WHEN year_text <> '' AND month_num IS NOT NULL AND day_text <> '' AND hour_text <> '' AND minute_text <> '' AND second_text <> '' THEN floor(cast((unix_timestamp(concat(year_text, '-', month_num, '-', day_text, ' ', hour_text, ':', minute_text, ':', second_text), 'yyyy-MM-dd HH:mm:ss') - min_epoch) AS double) / cast(${hivevar:BATCH_VALUE} AS double)) + 1
-        ELSE 1
-      END
-    WHEN '${hivevar:BATCH_MODE}' = 'calendar_month' THEN
-      CASE
-        WHEN year_text <> '' AND month_num IS NOT NULL THEN ((cast(year_text as int) - min_year) * 12) + (cast(month_num as int) - min_month) + 1
-        ELSE 1
-      END
-    ELSE floor(cast((record_number - 1) AS double) / cast(${hivevar:BATCH_VALUE} AS double)) + 1
-  END AS batch_id
+  cast(
+    CASE
+      WHEN '${hivevar:BATCH_MODE}' = 'time' THEN
+        CASE
+          WHEN n.year_text <> '' AND n.month_num IS NOT NULL AND n.day_text <> '' AND n.hour_text <> '' AND n.minute_text <> '' AND n.second_text <> '' THEN floor(cast((unix_timestamp(concat(n.year_text, '-', n.month_num, '-', n.day_text, ' ', n.hour_text, ':', n.minute_text, ':', n.second_text), 'yyyy-MM-dd HH:mm:ss') - ve.min_epoch) AS double) / cast(${hivevar:BATCH_VALUE} AS double)) + 1
+          ELSE 1
+        END
+      WHEN '${hivevar:BATCH_MODE}' = 'calendar_month' THEN
+        CASE
+          WHEN n.year_text <> '' AND n.month_num IS NOT NULL THEN (cast(n.year_text as int) * 12 + cast(n.month_num as int)) - ve.min_year_month + 1
+          ELSE 1
+        END
+      ELSE floor(cast((n.record_number - 1) AS double) / cast(${hivevar:BATCH_VALUE} AS double)) + 1
+    END
+  AS int) AS batch_id
 FROM normalized_validated n
-CROSS JOIN valid_epoch;
+CROSS JOIN valid_epoch ve;
 
 CREATE TABLE valid_logs AS
 SELECT
