@@ -32,15 +32,17 @@ if [[ "${AGGREGATION_MODE:-global}" != "global" && "${AGGREGATION_MODE:-global}"
     exit 1
 fi
 
-if [[ "$BATCH_MODE" != "records" && "$BATCH_MODE" != "time" ]]; then
-    echo "ERROR: batch_mode must be records or time" >&2
+if [[ "$BATCH_MODE" != "records" && "$BATCH_MODE" != "time" && "$BATCH_MODE" != "calendar_month" ]]; then
+    echo "ERROR: batch_mode must be records, time, or calendar_month" >&2
     exit 1
 fi
 if [[ "$QUERY" != "all" && "$QUERY" != "q1" && "$QUERY" != "q2" && "$QUERY" != "q3" ]]; then
     echo "ERROR: query must be one of all, q1, q2, q3" >&2
     exit 1
 fi
-if ! [[ "$BATCH_VALUE" =~ ^[0-9]+$ ]] || [[ "$BATCH_VALUE" -le 0 ]]; then
+if [[ "$BATCH_MODE" == "calendar_month" ]]; then
+    BATCH_VALUE=1
+elif ! [[ "$BATCH_VALUE" =~ ^[0-9]+$ ]] || [[ "$BATCH_VALUE" -le 0 ]]; then
     echo "ERROR: batch_value must be a positive integer" >&2
     exit 1
 fi
