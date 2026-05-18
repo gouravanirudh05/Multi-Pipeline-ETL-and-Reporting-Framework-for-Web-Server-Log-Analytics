@@ -106,7 +106,7 @@ function parseLogLine(line) {
     const parsedTimestamp = parseTimestamp(timestamp);
     const parsedStatus = parseInt(statusCode, 10);
     const parsedBytes =
-      bytesTransferred === "-" ? 0 : parseInt(bytesTransferred, 10);
+      bytesTransferred === "-" ? 0 : Number(bytesTransferred);
 
     if (
       !host ||

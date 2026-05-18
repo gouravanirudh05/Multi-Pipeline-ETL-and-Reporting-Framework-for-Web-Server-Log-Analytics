@@ -17,6 +17,9 @@ import re
 LOG_PATTERN = re.compile(
     r'^(\S+) \S+ \S+ \[(.*?)\] "(\S+) (.*?) (\S+)" (\d{3}) (\S+)'
 )
+TS_PATTERN = re.compile(
+    r'^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2})(?:\s+([+-])(\d{2})(\d{2}))?$'
+)
 
 MONTH_MAP = {
     'Jan': '01', 'Feb': '02', 'Mar': '03', 'Apr': '04',
@@ -60,6 +63,10 @@ def parse_log_line(line):
         raw_bytes   = match.group(7)
 
         if not host or not method or not resource or not protocol:
+            return None
+
+        # Strictly validate timestamp
+        if not TS_PATTERN.match(timestamp):
             return None
 
         # Parse date portion: "01/Jul/1995:00:00:01"

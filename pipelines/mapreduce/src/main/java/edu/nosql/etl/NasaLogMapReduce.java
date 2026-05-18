@@ -138,6 +138,9 @@ public class NasaLogMapReduce extends Configured implements Tool {
             String host = logMatch.group(1);
             String method = logMatch.group(3);
             String resourcePath = logMatch.group(4);
+            if (resourcePath == null || resourcePath.isEmpty()) {
+                return null;
+            }
             String protocol = logMatch.group(5);
 
             if (host.isEmpty() || method.isEmpty() || resourcePath.isEmpty() || protocol.isEmpty()) {
