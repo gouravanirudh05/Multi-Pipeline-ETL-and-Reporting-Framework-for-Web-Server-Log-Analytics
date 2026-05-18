@@ -9,13 +9,9 @@ CREATE EXTERNAL TABLE raw_logs(line STRING)
 STORED AS TEXTFILE
 LOCATION '${hivevar:INPUT_DIR}';
 
--- Use BLOCK__OFFSET__INSIDE__FILE (a Hive virtual column) as the record number.
--- This avoids a global ORDER BY that forces all 1.57 M rows into one reducer
--- and causes OutOfMemoryError. The block offset is a stable, monotonically
--- increasing value computed map-side with zero shuffle cost.
 CREATE TABLE raw_indexed AS
 SELECT
-  BLOCK__OFFSET__INSIDE__FILE AS record_number,
+  row_number() OVER (ORDER BY line) AS record_number,
   line
 FROM raw_logs;
 

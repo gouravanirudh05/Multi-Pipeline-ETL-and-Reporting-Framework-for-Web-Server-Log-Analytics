@@ -1,3 +1,5 @@
+package edu.nosql.etl;
+
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.IOException;
@@ -36,7 +38,7 @@ import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
 import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
 
-public class Mapreduce extends Configured implements Tool {
+public class NasaLogMapReduce extends Configured implements Tool {
     private static final Pattern LOG_PATTERN = Pattern.compile(
         "^(\\S+) \\S+ \\S+ \\[(.*?)\\] \"(\\S+) (.*?) (\\S+)\" (\\d{3}) (\\S+)"
     );
@@ -149,15 +151,6 @@ public class Mapreduce extends Configured implements Tool {
         } catch (RuntimeException ex) {
             return null;
         }
-    }
-
-    static String[] parseBatchRecord(String line) {
-        String[] parts = line.split("\\t", -1);
-        if (parts.length < 7 || !parts[0].startsWith("V|")) {
-            return null;
-        }
-        parts[0] = parts[0].substring(2);
-        return parts;
     }
 
     public static class MinEpochMapper extends Mapper<LongWritable, Text, Text, LongWritable> {
@@ -291,12 +284,6 @@ public class Mapreduce extends Configured implements Tool {
                 if (parsed == null) {
                     stat.malformedCount++;
                     context.write(new Text("M|" + batchId), new Text(line + "\tparse_failed"));
-                } else {
-                    context.write(
-                        new Text("V|" + batchId),
-                        new Text(parsed.host + "\t" + parsed.logDate + "\t" + parsed.logHour + "\t"
-                            + parsed.resourcePath + "\t" + parsed.statusCode + "\t" + parsed.bytesTransferred)
-                    );
                 }
             }
         }
@@ -316,21 +303,13 @@ public class Mapreduce extends Configured implements Tool {
         @Override
         protected void map(LongWritable key, Text value, Context context)
                 throws IOException, InterruptedException {
-            String[] row = parseBatchRecord(value.toString());
-            if (row == null) {
+            ParsedLog parsed = parseLogLine(value.toString());
+            if (parsed == null) {
                 return;
             }
-            String batchId = row[0];
-            String logDate = row[2];
-            String statusCode = row[5];
-            String bytesTransferred = row[6];
             context.write(
-                new Text(batchId + "|" + logDate + "|" + statusCode),
-                new Text("1\t" + bytesTransferred)
-            );
-            context.write(
-                new Text("0|" + logDate + "|" + statusCode),
-                new Text("1\t" + bytesTransferred)
+                new Text(parsed.logDate + "|" + parsed.statusCode),
+                new Text("1\t" + parsed.bytesTransferred)
             );
         }
     }
@@ -354,29 +333,36 @@ public class Mapreduce extends Configured implements Tool {
         @Override
         protected void map(LongWritable key, Text value, Context context)
                 throws IOException, InterruptedException {
-            String[] row = parseBatchRecord(value.toString());
-            if (row == null) {
+            ParsedLog parsed = parseLogLine(value.toString());
+            if (parsed == null) {
                 return;
             }
-            String batchId = row[0];
-            String host = row[1];
-            String resourcePath = row[4];
-            String bytesTransferred = row[6];
             context.write(
-                new Text(batchId + "|" + resourcePath),
-                new Text(bytesTransferred + "\t" + host)
-            );
-            context.write(
-                new Text("0|" + resourcePath),
-                new Text(bytesTransferred + "\t" + host)
+                new Text(parsed.resourcePath),
+                new Text(parsed.bytesTransferred + "\t" + parsed.host)
             );
         }
     }
 
     public static class TopResourcesReducer extends Reducer<Text, Text, Text, Text> {
+        private PriorityQueue<ResourceMetric> topResources;
+
         @Override
-        protected void reduce(Text key, Iterable<Text> values, Context context)
-                throws IOException, InterruptedException {
+        protected void setup(Context context) {
+            topResources = new PriorityQueue<ResourceMetric>(21, new Comparator<ResourceMetric>() {
+                @Override
+                public int compare(ResourceMetric left, ResourceMetric right) {
+                    int byCount = Long.compare(left.requestCount, right.requestCount);
+                    if (byCount != 0) {
+                        return byCount;
+                    }
+                    return right.resourcePath.compareTo(left.resourcePath);
+                }
+            });
+        }
+
+        @Override
+        protected void reduce(Text key, Iterable<Text> values, Context context) {
             long requestCount = 0L;
             long totalBytes = 0L;
             Set<String> hosts = new HashSet<String>();
@@ -388,7 +374,34 @@ public class Mapreduce extends Configured implements Tool {
                 hosts.add(parts[1]);
             }
 
-            context.write(key, new Text(requestCount + "\t" + totalBytes + "\t" + hosts.size()));
+            topResources.offer(
+                new ResourceMetric(key.toString(), requestCount, totalBytes, hosts.size())
+            );
+            if (topResources.size() > 20) {
+                topResources.poll();
+            }
+        }
+
+        @Override
+        protected void cleanup(Context context) throws IOException, InterruptedException {
+            List<ResourceMetric> rows = new ArrayList<ResourceMetric>(topResources);
+            Collections.sort(rows, new Comparator<ResourceMetric>() {
+                @Override
+                public int compare(ResourceMetric left, ResourceMetric right) {
+                    int byCount = Long.compare(right.requestCount, left.requestCount);
+                    if (byCount != 0) {
+                        return byCount;
+                    }
+                    return left.resourcePath.compareTo(right.resourcePath);
+                }
+            });
+
+            for (ResourceMetric row : rows) {
+                context.write(
+                    new Text(row.resourcePath),
+                    new Text(row.requestCount + "\t" + row.totalBytes + "\t" + row.distinctHostCount)
+                );
+            }
         }
     }
 
@@ -410,23 +423,14 @@ public class Mapreduce extends Configured implements Tool {
         @Override
         protected void map(LongWritable key, Text value, Context context)
                 throws IOException, InterruptedException {
-            String[] row = parseBatchRecord(value.toString());
-            if (row == null) {
+            ParsedLog parsed = parseLogLine(value.toString());
+            if (parsed == null) {
                 return;
             }
-            String batchId = row[0];
-            String logDate = row[2];
-            String logHour = row[3];
-            String host = row[1];
-            int statusCode = Integer.parseInt(row[5]);
-            boolean isError = statusCode >= 400 && statusCode <= 599;
+            boolean isError = parsed.statusCode >= 400 && parsed.statusCode <= 599;
             context.write(
-                new Text(batchId + "|" + logDate + "|" + logHour),
-                new Text((isError ? "1" : "0") + "\t" + (isError ? host : ""))
-            );
-            context.write(
-                new Text("0|" + logDate + "|" + logHour),
-                new Text((isError ? "1" : "0") + "\t" + (isError ? host : ""))
+                new Text(parsed.logDate + "|" + parsed.logHour),
+                new Text((isError ? "1" : "0") + "\t" + (isError ? parsed.host : ""))
             );
         }
     }
@@ -464,7 +468,7 @@ public class Mapreduce extends Configured implements Tool {
     @Override
     public int run(String[] args) throws Exception {
         if (args.length < 4) {
-            System.err.println("Usage: Mapreduce <log_file_path_or_json_array> <batch_mode> <batch_value> <run_uuid>");
+            System.err.println("Usage: NasaLogMapReduce <log_file_path_or_json_array> <batch_mode> <batch_value> <run_uuid>");
             return 2;
         }
 
@@ -549,7 +553,7 @@ public class Mapreduce extends Configured implements Tool {
             q1Job.setMapOutputValueClass(Text.class);
             q1Job.setOutputKeyClass(Text.class);
             q1Job.setOutputValueClass(Text.class);
-            FileInputFormat.addInputPath(q1Job, batchMetadataOutput);
+            addInputs(q1Job, inputPaths);
             if (!q1Job.waitForCompletion(true)) {
                 throw new IllegalStateException("Q1 MapReduce job failed");
             }
@@ -563,7 +567,8 @@ public class Mapreduce extends Configured implements Tool {
             q2Job.setMapOutputValueClass(Text.class);
             q2Job.setOutputKeyClass(Text.class);
             q2Job.setOutputValueClass(Text.class);
-            FileInputFormat.addInputPath(q2Job, batchMetadataOutput);
+            q2Job.setNumReduceTasks(1);
+            addInputs(q2Job, inputPaths);
             if (!q2Job.waitForCompletion(true)) {
                 throw new IllegalStateException("Q2 MapReduce job failed");
             }
@@ -577,7 +582,7 @@ public class Mapreduce extends Configured implements Tool {
             q3Job.setMapOutputValueClass(Text.class);
             q3Job.setOutputKeyClass(Text.class);
             q3Job.setOutputValueClass(Text.class);
-            FileInputFormat.addInputPath(q3Job, batchMetadataOutput);
+            addInputs(q3Job, inputPaths);
             if (!q3Job.waitForCompletion(true)) {
                 throw new IllegalStateException("Q3 MapReduce job failed");
             }
@@ -616,7 +621,7 @@ public class Mapreduce extends Configured implements Tool {
     private Job createJob(String name, Class<? extends Mapper> mapperClass,
             Class<? extends Reducer> reducerClass, Path outputPath) throws IOException {
         Job job = Job.getInstance(getConf(), name);
-        job.setJarByClass(Mapreduce.class);
+        job.setJarByClass(NasaLogMapReduce.class);
         job.setMapperClass(mapperClass);
         job.setReducerClass(reducerClass);
         FileOutputFormat.setOutputPath(job, outputPath);
@@ -720,46 +725,8 @@ public class Mapreduce extends Configured implements Tool {
             .append("batch_interval_seconds = ")
             .append("time".equals(batchMode) ? String.valueOf(batchValue) : "NULL")
             .append(" WHERE run_uuid = ").append(sqlString(runUuid)).append(";\n");
-        appendReportingTableSync(sql, runUuid);
 
         runPsql(sql.toString());
-    }
-
-    private void appendReportingTableSync(StringBuilder sql, String runUuid) {
-        sql.append("DELETE FROM query_results WHERE run_id = ").append(sqlString(runUuid)).append(";\n");
-        sql.append("INSERT INTO run_metadata ")
-            .append("(run_id, pipeline_name, query_name, batch_size, average_batch_size, ")
-            .append("records_processed, malformed_record_count, runtime, execution_timestamp, ")
-            .append("status, batch_mode, batch_interval_seconds, total_batches) ")
-            .append("SELECT run_uuid, pipeline, 'all', batch_size, avg_batch_size, total_records, ")
-            .append("malformed_count, runtime_seconds, COALESCE(started_at, NOW()), status, ")
-            .append("batch_mode, batch_interval_seconds, total_batches FROM etl_runs ")
-            .append("WHERE run_uuid = ").append(sqlString(runUuid)).append(" ")
-            .append("ON CONFLICT (run_id) DO UPDATE SET ")
-            .append("pipeline_name = EXCLUDED.pipeline_name, ")
-            .append("query_name = EXCLUDED.query_name, ")
-            .append("batch_size = EXCLUDED.batch_size, ")
-            .append("average_batch_size = EXCLUDED.average_batch_size, ")
-            .append("records_processed = EXCLUDED.records_processed, ")
-            .append("malformed_record_count = EXCLUDED.malformed_record_count, ")
-            .append("runtime = EXCLUDED.runtime, ")
-            .append("execution_timestamp = EXCLUDED.execution_timestamp, ")
-            .append("status = EXCLUDED.status, ")
-            .append("batch_mode = EXCLUDED.batch_mode, ")
-            .append("batch_interval_seconds = EXCLUDED.batch_interval_seconds, ")
-            .append("total_batches = EXCLUDED.total_batches;\n");
-        sql.append("INSERT INTO query_results (run_id, pipeline_name, query_name, batch_id, result_scope, result_key, result_value, execution_timestamp) ")
-            .append("SELECT run_uuid, pipeline, 'q1_daily_traffic', batch_id, result_scope, concat(log_date::text, ':', status_code::text), ")
-            .append("jsonb_build_object('log_date', log_date, 'status_code', status_code, 'request_count', request_count, 'total_bytes', total_bytes), executed_at ")
-            .append("FROM daily_traffic WHERE run_uuid = ").append(sqlString(runUuid)).append(";\n");
-        sql.append("INSERT INTO query_results (run_id, pipeline_name, query_name, batch_id, result_scope, result_key, result_value, execution_timestamp) ")
-            .append("SELECT run_uuid, pipeline, 'q2_top_resources', batch_id, result_scope, resource_path, ")
-            .append("jsonb_build_object('resource_path', resource_path, 'request_count', request_count, 'total_bytes', total_bytes, 'distinct_host_count', distinct_host_count), executed_at ")
-            .append("FROM top_resources WHERE run_uuid = ").append(sqlString(runUuid)).append(";\n");
-        sql.append("INSERT INTO query_results (run_id, pipeline_name, query_name, batch_id, result_scope, result_key, result_value, execution_timestamp) ")
-            .append("SELECT run_uuid, pipeline, 'q3_hourly_errors', batch_id, result_scope, concat(log_date::text, ':', log_hour::text), ")
-            .append("jsonb_build_object('log_date', log_date, 'log_hour', log_hour, 'error_request_count', error_request_count, 'total_request_count', total_request_count, 'error_rate', error_rate, 'distinct_error_hosts', distinct_error_hosts), executed_at ")
-            .append("FROM hourly_errors WHERE run_uuid = ").append(sqlString(runUuid)).append(";\n");
     }
 
     private void appendBatchMetadata(StringBuilder sql, String runUuid, int batchValue,
@@ -803,17 +770,16 @@ public class Mapreduce extends Configured implements Tool {
                 continue;
             }
             String[] keyParts = parts[0].split("\\|", -1);
-            if (keyParts.length < 3) {
+            if (keyParts.length < 2) {
                 continue;
             }
             sql.append("INSERT INTO daily_traffic ")
-                .append("(pipeline, run_uuid, batch_id, result_scope, log_date, status_code, request_count, total_bytes) VALUES (")
+                .append("(pipeline, run_uuid, batch_id, log_date, status_code, request_count, total_bytes) VALUES (")
                 .append("'mapreduce', ")
                 .append(sqlString(runUuid)).append(", ")
-                .append(keyParts[0]).append(", ")
-                .append("0".equals(keyParts[0]) ? "'aggregate'" : "'per_batch'").append(", ")
-                .append(sqlString(keyParts[1])).append(", ")
-                .append(keyParts[2]).append(", ")
+                .append(batchId).append(", ")
+                .append(sqlString(keyParts[0])).append(", ")
+                .append(keyParts[1]).append(", ")
                 .append(parts[1]).append(", ")
                 .append(parts[2]).append(");\n");
         }
@@ -826,17 +792,12 @@ public class Mapreduce extends Configured implements Tool {
             if (parts.length < 4) {
                 continue;
             }
-            String[] keyParts = parts[0].split("\\|", 2);
-            if (keyParts.length < 2) {
-                continue;
-            }
             sql.append("INSERT INTO top_resources ")
-                .append("(pipeline, run_uuid, batch_id, result_scope, resource_path, request_count, total_bytes, distinct_host_count) VALUES (")
+                .append("(pipeline, run_uuid, batch_id, resource_path, request_count, total_bytes, distinct_host_count) VALUES (")
                 .append("'mapreduce', ")
                 .append(sqlString(runUuid)).append(", ")
-                .append(keyParts[0]).append(", ")
-                .append("0".equals(keyParts[0]) ? "'aggregate'" : "'per_batch'").append(", ")
-                .append(sqlString(keyParts[1])).append(", ")
+                .append(batchId).append(", ")
+                .append(sqlString(parts[0])).append(", ")
                 .append(parts[1]).append(", ")
                 .append(parts[2]).append(", ")
                 .append(parts[3]).append(");\n");
@@ -851,17 +812,16 @@ public class Mapreduce extends Configured implements Tool {
                 continue;
             }
             String[] keyParts = parts[0].split("\\|", -1);
-            if (keyParts.length < 3) {
+            if (keyParts.length < 2) {
                 continue;
             }
             sql.append("INSERT INTO hourly_errors ")
-                .append("(pipeline, run_uuid, batch_id, result_scope, log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts) VALUES (")
+                .append("(pipeline, run_uuid, batch_id, log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts) VALUES (")
                 .append("'mapreduce', ")
                 .append(sqlString(runUuid)).append(", ")
-                .append(keyParts[0]).append(", ")
-                .append("0".equals(keyParts[0]) ? "'aggregate'" : "'per_batch'").append(", ")
-                .append(sqlString(keyParts[1])).append(", ")
-                .append(keyParts[2]).append(", ")
+                .append(batchId).append(", ")
+                .append(sqlString(keyParts[0])).append(", ")
+                .append(keyParts[1]).append(", ")
                 .append(parts[1]).append(", ")
                 .append(parts[2]).append(", ")
                 .append(parts[3]).append(", ")
@@ -914,12 +874,6 @@ public class Mapreduce extends Configured implements Tool {
             + ");\n"
             + "ALTER TABLE etl_runs ADD COLUMN IF NOT EXISTS batch_mode VARCHAR(20) DEFAULT 'records';\n"
             + "ALTER TABLE etl_runs ADD COLUMN IF NOT EXISTS batch_interval_seconds INTEGER;\n"
-            + "CREATE TABLE IF NOT EXISTS run_metadata ("
-            + "run_id VARCHAR(64) PRIMARY KEY, pipeline_name VARCHAR(20), query_name VARCHAR(20), "
-            + "batch_size INTEGER, average_batch_size NUMERIC(10,2), records_processed INTEGER, "
-            + "malformed_record_count INTEGER, runtime NUMERIC(10,3), execution_timestamp TIMESTAMPTZ, "
-            + "status VARCHAR(20), batch_mode VARCHAR(20), batch_interval_seconds INTEGER, total_batches INTEGER"
-            + ");\n"
             + "CREATE TABLE IF NOT EXISTS batch_metadata ("
             + "id SERIAL PRIMARY KEY, run_uuid VARCHAR(64), pipeline VARCHAR(20), batch_id INTEGER, "
             + "batch_size INTEGER, records_processed INTEGER, malformed_count INTEGER DEFAULT 0, "
@@ -933,33 +887,23 @@ public class Mapreduce extends Configured implements Tool {
             + "id SERIAL PRIMARY KEY, run_uuid VARCHAR(64), pipeline VARCHAR(20), batch_id INTEGER, "
             + "raw_line TEXT, reason TEXT, recorded_at TIMESTAMPTZ DEFAULT NOW()"
             + ");\n"
-            + "CREATE TABLE IF NOT EXISTS query_results ("
-            + "id SERIAL PRIMARY KEY, run_id VARCHAR(64), pipeline_name VARCHAR(20), query_name VARCHAR(20), "
-            + "batch_id INTEGER, result_key TEXT, result_value JSONB, execution_timestamp TIMESTAMPTZ DEFAULT NOW()"
-            + ");\n"
-            + "ALTER TABLE query_results ADD COLUMN IF NOT EXISTS result_scope VARCHAR(20) DEFAULT 'aggregate';\n"
             + "CREATE TABLE IF NOT EXISTS daily_traffic ("
             + "id SERIAL PRIMARY KEY, pipeline VARCHAR(20), run_uuid VARCHAR(64), batch_id INTEGER, "
             + "executed_at TIMESTAMPTZ DEFAULT NOW(), log_date DATE, status_code INTEGER, "
             + "request_count BIGINT, total_bytes BIGINT"
             + ");\n"
-            + "ALTER TABLE daily_traffic ADD COLUMN IF NOT EXISTS result_scope VARCHAR(20) DEFAULT 'aggregate';\n"
             + "CREATE TABLE IF NOT EXISTS top_resources ("
             + "id SERIAL PRIMARY KEY, pipeline VARCHAR(20), run_uuid VARCHAR(64), batch_id INTEGER, "
             + "executed_at TIMESTAMPTZ DEFAULT NOW(), resource_path TEXT, request_count BIGINT, "
             + "total_bytes BIGINT, distinct_host_count BIGINT"
             + ");\n"
-            + "ALTER TABLE top_resources ADD COLUMN IF NOT EXISTS result_scope VARCHAR(20) DEFAULT 'aggregate';\n"
             + "CREATE TABLE IF NOT EXISTS hourly_errors ("
             + "id SERIAL PRIMARY KEY, pipeline VARCHAR(20), run_uuid VARCHAR(64), batch_id INTEGER, "
             + "executed_at TIMESTAMPTZ DEFAULT NOW(), log_date DATE, log_hour SMALLINT, "
             + "error_request_count BIGINT, total_request_count BIGINT, error_rate NUMERIC(6,4), "
             + "distinct_error_hosts BIGINT"
             + ");\n"
-            + "ALTER TABLE hourly_errors ADD COLUMN IF NOT EXISTS result_scope VARCHAR(20) DEFAULT 'aggregate';\n"
             + "CREATE INDEX IF NOT EXISTS idx_batch_run ON batch_metadata(run_uuid, batch_id);\n"
-            + "CREATE INDEX IF NOT EXISTS idx_run_metadata_run ON run_metadata(run_id);\n"
-            + "CREATE INDEX IF NOT EXISTS idx_query_results_run ON query_results(run_id, query_name);\n"
             + "CREATE INDEX IF NOT EXISTS idx_malformed_summary_run ON malformed_record_summary(run_uuid, batch_id);\n"
             + "CREATE INDEX IF NOT EXISTS idx_malformed_records_run ON malformed_records(run_uuid, batch_id);\n"
             + "CREATE INDEX IF NOT EXISTS idx_daily_pipeline_date ON daily_traffic(pipeline, log_date);\n"
@@ -1056,7 +1000,7 @@ public class Mapreduce extends Configured implements Tool {
     }
 
     public static void main(String[] args) throws Exception {
-        int exitCode = ToolRunner.run(new Mapreduce(), args);
+        int exitCode = ToolRunner.run(new NasaLogMapReduce(), args);
         System.exit(exitCode);
     }
 }

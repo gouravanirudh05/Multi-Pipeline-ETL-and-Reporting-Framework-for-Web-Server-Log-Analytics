@@ -1,6 +1,6 @@
 # Java MapReduce Pipeline
 
-This pipeline runs the NASA log ETL workload from `Mapreduce.java` with Hadoop MapReduce in local
+This pipeline runs the NASA log ETL workload with Hadoop MapReduce in local
 execution mode over HDFS. The runner uploads local logs with `hdfs dfs -put`,
 then submits Java jobs with `mapreduce.framework.name=local`, so YARN is not
 required.

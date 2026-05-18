@@ -669,21 +669,6 @@
   started_at       TIMESTAMPTZ
   completed_at     TIMESTAMPTZ
 
-<span style="color:#2563eb;">TABLE</span> run_metadata
-  run_id                  VARCHAR(64)    PRIMARY KEY
-  pipeline_name           VARCHAR(20)
-  query_name              VARCHAR(20)
-  batch_size              INTEGER
-  average_batch_size      NUMERIC(10,2)
-  records_processed       INTEGER
-  malformed_record_count  INTEGER
-  runtime                 NUMERIC(10,3)
-  execution_timestamp     TIMESTAMPTZ
-  status                  VARCHAR(20)
-  batch_mode              VARCHAR(20)
-  batch_interval_seconds  INTEGER
-  total_batches           INTEGER
-
 <span style="color:#2563eb;">TABLE</span> batch_metadata
   id               SERIAL PK
   pipeline         VARCHAR(20)
@@ -703,17 +688,6 @@
   malformed_count INTEGER
   recorded_at      TIMESTAMPTZ
 
-<span style="color:#2563eb;">TABLE</span> query_results
-  id               SERIAL PK
-  run_id           VARCHAR(64)
-  pipeline_name    VARCHAR(20)
-  query_name       VARCHAR(20)
-  batch_id         INTEGER
-  result_scope     VARCHAR(20)    -- aggregate | per_batch
-  result_key       TEXT
-  result_value     JSONB
-  execution_timestamp TIMESTAMPTZ
-
 <span style="color:#2563eb;">TABLE</span> malformed_records
   id               SERIAL PK
   pipeline         VARCHAR(20)
@@ -728,7 +702,6 @@
   pipeline         VARCHAR(20)
   run_uuid         VARCHAR(64)
   batch_id         INTEGER
-  result_scope     VARCHAR(20)    -- aggregate | per_batch
   executed_at      TIMESTAMPTZ
   log_date         DATE
   status_code      INTEGER
@@ -740,7 +713,6 @@
   pipeline              VARCHAR(20)
   run_uuid              VARCHAR(64)
   batch_id              INTEGER
-  result_scope          VARCHAR(20)    -- aggregate | per_batch
   executed_at           TIMESTAMPTZ
   resource_path         TEXT
   request_count         BIGINT
@@ -752,7 +724,6 @@
   pipeline              VARCHAR(20)
   run_uuid              VARCHAR(64)
   batch_id              INTEGER
-  result_scope          VARCHAR(20)    -- aggregate | per_batch
   executed_at           TIMESTAMPTZ
   log_date              DATE
   log_hour              SMALLINT
@@ -763,8 +734,6 @@
 
 <span style="color:#15803d;">-- Indexes for query performance --</span>
 idx_batch_run              ON batch_metadata(run_uuid, batch_id)
-idx_run_metadata_run       ON run_metadata(run_id)
-idx_query_results_run      ON query_results(run_id, query_name)
 idx_malformed_summary_run  ON malformed_record_summary(run_uuid, batch_id)
 idx_malformed_records_run  ON malformed_records(run_uuid, batch_id)
 idx_daily_pipeline_date ON daily_traffic(pipeline, log_date)
@@ -1030,53 +999,23 @@ function renderResults(data) {
     </div>
 
     <div class="result-section">
-      <h3>Run Metadata <span class="badge">${(data.run_metadata||[]).length} rows</span></h3>
-      ${tableHtml(data.run_metadata||[], ["run_id","pipeline_name","query_name","batch_size","average_batch_size","records_processed","malformed_record_count","runtime","execution_timestamp","status"])}
-    </div>
-
-    <div class="result-section">
       <h3>Batch Metadata <span class="badge">${(data.batches||[]).length} rows</span></h3>
       ${tableHtml(data.batches||[], ["batch_id","batch_size","records_processed","malformed_count","started_at","completed_at"])}
     </div>
 
     <div class="result-section">
-      <h3>Malformed Record Summary <span class="badge">${(data.malformed_summary||[]).length} rows</span></h3>
-      ${tableHtml(data.malformed_summary||[], ["batch_id","malformed_count","recorded_at"])}
-    </div>
-
-    <div class="result-section">
-      <h3>Unified Query Results <span class="badge">${(data.query_results||[]).length} rows</span></h3>
-      ${tableHtml(data.query_results||[], ["query_name","batch_id","result_scope","result_key","result_value","execution_timestamp"])}
-    </div>
-
-    <div class="result-section">
-      <h3>Q1 - Aggregate Daily Traffic <span class="badge">${(data.q1||[]).length} rows</span></h3>
+      <h3>Q1 - Daily Traffic Summary <span class="badge">${(data.q1||[]).length} rows</span></h3>
       ${tableHtml(data.q1||[], ["log_date","status_code","request_count","total_bytes"])}
     </div>
 
     <div class="result-section">
-      <h3>Q1 - Per-Batch Daily Traffic <span class="badge">${(data.q1_batches||[]).length} rows</span></h3>
-      ${tableHtml(data.q1_batches||[], ["batch_id","log_date","status_code","request_count","total_bytes"])}
-    </div>
-
-    <div class="result-section">
-      <h3>Q2 - Aggregate Top Requested Resources <span class="badge">${(data.q2||[]).length} rows</span></h3>
+      <h3>Q2 - Top Requested Resources <span class="badge">${(data.q2||[]).length} rows</span></h3>
       ${tableHtml(data.q2||[], ["resource_path","request_count","total_bytes","distinct_host_count"])}
     </div>
 
     <div class="result-section">
-      <h3>Q2 - Per-Batch Requested Resources <span class="badge">${(data.q2_batches||[]).length} rows</span></h3>
-      ${tableHtml(data.q2_batches||[], ["batch_id","resource_path","request_count","total_bytes","distinct_host_count"])}
-    </div>
-
-    <div class="result-section">
-      <h3>Q3 - Aggregate Hourly Error Analysis <span class="badge">${(data.q3||[]).length} rows</span></h3>
+      <h3>Q3 - Hourly Error Analysis <span class="badge">${(data.q3||[]).length} rows</span></h3>
       ${tableHtml(data.q3||[], ["log_date","log_hour","error_request_count","total_request_count","error_rate","distinct_error_hosts"])}
-    </div>
-
-    <div class="result-section">
-      <h3>Q3 - Per-Batch Hourly Error Analysis <span class="badge">${(data.q3_batches||[]).length} rows</span></h3>
-      ${tableHtml(data.q3_batches||[], ["batch_id","log_date","log_hour","error_request_count","total_request_count","error_rate","distinct_error_hosts"])}
     </div>
   `;
 }
@@ -1097,9 +1036,6 @@ function formatCell(val) {
   }
   if (typeof val === "number") {
     return val.toLocaleString();
-  }
-  if (typeof val === "object") {
-    return escapeHtml(JSON.stringify(val));
   }
   return escapeHtml(String(val));
 }

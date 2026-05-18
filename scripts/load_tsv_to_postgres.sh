@@ -37,22 +37,6 @@ CREATE TABLE IF NOT EXISTS etl_runs (
 ALTER TABLE etl_runs ADD COLUMN IF NOT EXISTS batch_mode VARCHAR(20) DEFAULT 'records';
 ALTER TABLE etl_runs ADD COLUMN IF NOT EXISTS batch_interval_seconds INTEGER;
 
-CREATE TABLE IF NOT EXISTS run_metadata (
-    run_id VARCHAR(64) PRIMARY KEY,
-    pipeline_name VARCHAR(20),
-    query_name VARCHAR(20),
-    batch_size INTEGER,
-    average_batch_size NUMERIC(10,2),
-    records_processed INTEGER,
-    malformed_record_count INTEGER,
-    runtime NUMERIC(10,3),
-    execution_timestamp TIMESTAMPTZ,
-    status VARCHAR(20),
-    batch_mode VARCHAR(20),
-    batch_interval_seconds INTEGER,
-    total_batches INTEGER
-);
-
 CREATE TABLE IF NOT EXISTS batch_metadata (
     id SERIAL PRIMARY KEY,
     run_uuid VARCHAR(64),
@@ -81,17 +65,6 @@ CREATE TABLE IF NOT EXISTS malformed_records (
     reason TEXT,
     recorded_at TIMESTAMPTZ DEFAULT NOW()
 );
-CREATE TABLE IF NOT EXISTS query_results (
-    id SERIAL PRIMARY KEY,
-    run_id VARCHAR(64),
-    pipeline_name VARCHAR(20),
-    query_name VARCHAR(20),
-    batch_id INTEGER,
-    result_key TEXT,
-    result_value JSONB,
-    execution_timestamp TIMESTAMPTZ DEFAULT NOW()
-);
-ALTER TABLE query_results ADD COLUMN IF NOT EXISTS result_scope VARCHAR(20) DEFAULT 'aggregate';
 CREATE TABLE IF NOT EXISTS daily_traffic (
     id SERIAL PRIMARY KEY,
     pipeline VARCHAR(20),
@@ -103,7 +76,6 @@ CREATE TABLE IF NOT EXISTS daily_traffic (
     request_count BIGINT,
     total_bytes BIGINT
 );
-ALTER TABLE daily_traffic ADD COLUMN IF NOT EXISTS result_scope VARCHAR(20) DEFAULT 'aggregate';
 CREATE TABLE IF NOT EXISTS top_resources (
     id SERIAL PRIMARY KEY,
     pipeline VARCHAR(20),
@@ -115,7 +87,6 @@ CREATE TABLE IF NOT EXISTS top_resources (
     total_bytes BIGINT,
     distinct_host_count BIGINT
 );
-ALTER TABLE top_resources ADD COLUMN IF NOT EXISTS result_scope VARCHAR(20) DEFAULT 'aggregate';
 CREATE TABLE IF NOT EXISTS hourly_errors (
     id SERIAL PRIMARY KEY,
     pipeline VARCHAR(20),
@@ -129,10 +100,7 @@ CREATE TABLE IF NOT EXISTS hourly_errors (
     error_rate NUMERIC(6,4),
     distinct_error_hosts BIGINT
 );
-ALTER TABLE hourly_errors ADD COLUMN IF NOT EXISTS result_scope VARCHAR(20) DEFAULT 'aggregate';
 CREATE INDEX IF NOT EXISTS idx_batch_run ON batch_metadata(run_uuid, batch_id);
-CREATE INDEX IF NOT EXISTS idx_run_metadata_run ON run_metadata(run_id);
-CREATE INDEX IF NOT EXISTS idx_query_results_run ON query_results(run_id, query_name);
 CREATE INDEX IF NOT EXISTS idx_malformed_summary_run ON malformed_record_summary(run_uuid, batch_id);
 CREATE INDEX IF NOT EXISTS idx_malformed_records_run ON malformed_records(run_uuid, batch_id);
 CREATE INDEX IF NOT EXISTS idx_daily_pipeline_date ON daily_traffic(pipeline, log_date);
@@ -156,7 +124,6 @@ DELETE FROM hourly_errors WHERE run_uuid = '$RUN_UUID';
 DELETE FROM batch_metadata WHERE run_uuid = '$RUN_UUID';
 DELETE FROM malformed_record_summary WHERE run_uuid = '$RUN_UUID';
 DELETE FROM malformed_records WHERE run_uuid = '$RUN_UUID';
-DELETE FROM query_results WHERE run_id = '$RUN_UUID';
 
 CREATE TEMP TABLE tmp_batch_metadata (
     batch_id INTEGER,
@@ -170,21 +137,18 @@ CREATE TEMP TABLE tmp_malformed_records (
     reason TEXT
 );
 CREATE TEMP TABLE tmp_q1 (
-    batch_id INTEGER,
     log_date DATE,
     status_code INTEGER,
     request_count BIGINT,
     total_bytes BIGINT
 );
 CREATE TEMP TABLE tmp_q2 (
-    batch_id INTEGER,
     resource_path TEXT,
     request_count BIGINT,
     total_bytes BIGINT,
     distinct_host_count BIGINT
 );
 CREATE TEMP TABLE tmp_q3 (
-    batch_id INTEGER,
     log_date DATE,
     log_hour SMALLINT,
     error_request_count BIGINT,
@@ -226,46 +190,22 @@ SELECT '$RUN_UUID', '$PIPELINE', batch_id, raw_line, reason
 FROM tmp_malformed_records;
 
 INSERT INTO daily_traffic
-    (pipeline, run_uuid, batch_id, result_scope, log_date, status_code, request_count, total_bytes)
-SELECT '$PIPELINE', '$RUN_UUID', batch_id, 'aggregate',
+    (pipeline, run_uuid, batch_id, log_date, status_code, request_count, total_bytes)
+SELECT '$PIPELINE', '$RUN_UUID', COALESCE((SELECT max(batch_id) FROM tmp_batch_metadata), 0),
        log_date, status_code, request_count, total_bytes
-FROM tmp_q1
-WHERE batch_id = 0;
-
-INSERT INTO daily_traffic
-    (pipeline, run_uuid, batch_id, result_scope, log_date, status_code, request_count, total_bytes)
-SELECT '$PIPELINE', '$RUN_UUID', batch_id, 'per_batch',
-       log_date, status_code, request_count, total_bytes
-FROM tmp_q1
-WHERE batch_id <> 0;
+FROM tmp_q1;
 
 INSERT INTO top_resources
-    (pipeline, run_uuid, batch_id, result_scope, resource_path, request_count, total_bytes, distinct_host_count)
-SELECT '$PIPELINE', '$RUN_UUID', batch_id, 'aggregate',
+    (pipeline, run_uuid, batch_id, resource_path, request_count, total_bytes, distinct_host_count)
+SELECT '$PIPELINE', '$RUN_UUID', COALESCE((SELECT max(batch_id) FROM tmp_batch_metadata), 0),
        resource_path, request_count, total_bytes, distinct_host_count
-FROM tmp_q2
-WHERE batch_id = 0;
-
-INSERT INTO top_resources
-    (pipeline, run_uuid, batch_id, result_scope, resource_path, request_count, total_bytes, distinct_host_count)
-SELECT '$PIPELINE', '$RUN_UUID', batch_id, 'per_batch',
-       resource_path, request_count, total_bytes, distinct_host_count
-FROM tmp_q2
-WHERE batch_id <> 0;
+FROM tmp_q2;
 
 INSERT INTO hourly_errors
-    (pipeline, run_uuid, batch_id, result_scope, log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts)
-SELECT '$PIPELINE', '$RUN_UUID', batch_id, 'aggregate',
+    (pipeline, run_uuid, batch_id, log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts)
+SELECT '$PIPELINE', '$RUN_UUID', COALESCE((SELECT max(batch_id) FROM tmp_batch_metadata), 0),
        log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts
-FROM tmp_q3
-WHERE batch_id = 0;
-
-INSERT INTO hourly_errors
-    (pipeline, run_uuid, batch_id, result_scope, log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts)
-SELECT '$PIPELINE', '$RUN_UUID', batch_id, 'per_batch',
-       log_date, log_hour, error_request_count, total_request_count, error_rate, distinct_error_hosts
-FROM tmp_q3
-WHERE batch_id <> 0;
+FROM tmp_q3;
 
 UPDATE etl_runs
 SET total_records = COALESCE((SELECT sum(records_processed) FROM tmp_batch_metadata), 0),
@@ -277,51 +217,6 @@ SET total_records = COALESCE((SELECT sum(records_processed) FROM tmp_batch_metad
     completed_at = NOW(),
     batch_mode = '$BATCH_MODE',
     batch_interval_seconds = $(if [[ "$BATCH_MODE" == "time" ]]; then printf "%s" "$BATCH_VALUE"; else printf "NULL"; fi)
-WHERE run_uuid = '$RUN_UUID';
-
-INSERT INTO run_metadata (
-    run_id, pipeline_name, query_name, batch_size, average_batch_size,
-    records_processed, malformed_record_count, runtime, execution_timestamp,
-    status, batch_mode, batch_interval_seconds, total_batches
-)
-SELECT run_uuid, pipeline, '$QUERY', batch_size, avg_batch_size, total_records,
-       malformed_count, runtime_seconds, COALESCE(started_at, NOW()), status,
-       batch_mode, batch_interval_seconds, total_batches
-FROM etl_runs
-WHERE run_uuid = '$RUN_UUID'
-ON CONFLICT (run_id) DO UPDATE SET
-    pipeline_name = EXCLUDED.pipeline_name,
-    query_name = EXCLUDED.query_name,
-    batch_size = EXCLUDED.batch_size,
-    average_batch_size = EXCLUDED.average_batch_size,
-    records_processed = EXCLUDED.records_processed,
-    malformed_record_count = EXCLUDED.malformed_record_count,
-    runtime = EXCLUDED.runtime,
-    execution_timestamp = EXCLUDED.execution_timestamp,
-    status = EXCLUDED.status,
-    batch_mode = EXCLUDED.batch_mode,
-    batch_interval_seconds = EXCLUDED.batch_interval_seconds,
-    total_batches = EXCLUDED.total_batches;
-
-INSERT INTO query_results (run_id, pipeline_name, query_name, batch_id, result_scope, result_key, result_value)
-SELECT '$RUN_UUID', '$PIPELINE', 'q1_daily_traffic', batch_id, result_scope,
-       concat(log_date::text, ':', status_code::text),
-       jsonb_build_object('log_date', log_date, 'status_code', status_code, 'request_count', request_count, 'total_bytes', total_bytes)
-FROM daily_traffic
-WHERE run_uuid = '$RUN_UUID';
-
-INSERT INTO query_results (run_id, pipeline_name, query_name, batch_id, result_scope, result_key, result_value)
-SELECT '$RUN_UUID', '$PIPELINE', 'q2_top_resources', batch_id, result_scope,
-       resource_path,
-       jsonb_build_object('resource_path', resource_path, 'request_count', request_count, 'total_bytes', total_bytes, 'distinct_host_count', distinct_host_count)
-FROM top_resources
-WHERE run_uuid = '$RUN_UUID';
-
-INSERT INTO query_results (run_id, pipeline_name, query_name, batch_id, result_scope, result_key, result_value)
-SELECT '$RUN_UUID', '$PIPELINE', 'q3_hourly_errors', batch_id, result_scope,
-       concat(log_date::text, ':', log_hour::text),
-       jsonb_build_object('log_date', log_date, 'log_hour', log_hour, 'error_request_count', error_request_count, 'total_request_count', total_request_count, 'error_rate', error_rate, 'distinct_error_hosts', distinct_error_hosts)
-FROM hourly_errors
 WHERE run_uuid = '$RUN_UUID';
 SQL
 
