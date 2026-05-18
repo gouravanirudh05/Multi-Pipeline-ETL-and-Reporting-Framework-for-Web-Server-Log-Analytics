@@ -577,7 +577,7 @@ public class NasaLogMapReduce extends Configured implements Tool {
 
         List<String> inputPaths = parsePathList(args[0]);
         String batchMode = args[1];
-        long batchValue = "calendar_month".equals(batchMode) ? 0L : Long.parseLong(args[2]);
+        int batchValue = "calendar_month".equals(batchMode) ? 0 : Integer.parseInt(args[2]);
         String runUuid = args[3];
         String query = args.length >= 5 ? args[4] : "all";
         String aggregationMode = args.length >= 6 ? args[5] : "global";
