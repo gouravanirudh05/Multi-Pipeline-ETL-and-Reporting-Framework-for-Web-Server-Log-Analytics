@@ -281,16 +281,16 @@ async def run_pipeline(req: Request):
 
     if not pipeline or not log_files:
         return {"error": "Missing pipeline or log_files"}
-    if batch_mode != "time":
-        return {"error": "batch_mode must be 'time'"}
+    if batch_mode not in {"time", "calendar_month"}:
+        return {"error": "batch_mode must be 'time' or 'calendar_month'"}
     if aggregation_mode not in {"global", "per_batch"}:
         return {"error": "aggregation_mode must be 'global' or 'per_batch'"}
-    if batch_interval_seconds not in {604800, 2592000}:
-        return {"error": "batch_interval_seconds must be exactly 604800 (week) or 2592000 (month)"}
+    if batch_mode == "time" and batch_interval_seconds != 604800:
+        return {"error": "batch_interval_seconds must be 604800 for time mode"}
     if query not in {"all", "q1", "q2", "q3"}:
         return {"error": "query must be one of: all, q1, q2, q3"}
 
-    batch_value = batch_interval_seconds
+    batch_value = batch_interval_seconds if batch_mode == "time" else "calendar_month"
     batch_size = None
 
     # Generate UUID for this run

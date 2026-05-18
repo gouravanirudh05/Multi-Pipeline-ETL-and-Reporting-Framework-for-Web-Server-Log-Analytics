@@ -188,6 +188,8 @@ public class NasaLogMapReduce extends Configured implements Tool {
 
     public static class MinEpochMapper extends Mapper<LongWritable, Text, Text, LongWritable> {
         private static final Text MIN_KEY = new Text("min_epoch");
+        private static final Text MIN_YEAR = new Text("min_year");
+        private static final Text MIN_MONTH = new Text("min_month");
 
         @Override
         protected void map(LongWritable key, Text value, Context context)
@@ -200,6 +202,10 @@ public class NasaLogMapReduce extends Configured implements Tool {
             }
             context.getCounter(PipelineCounter.VALID_LINES).increment(1);
             context.write(MIN_KEY, new LongWritable(parsed.epochSeconds));
+            if (parsed.logDate != null && parsed.logDate.length() >= 7) {
+                context.write(MIN_YEAR, new LongWritable(Integer.parseInt(parsed.logDate.substring(0, 4))));
+                context.write(MIN_MONTH, new LongWritable(Integer.parseInt(parsed.logDate.substring(5, 7))));
+            }
         }
     }
 
@@ -220,11 +226,17 @@ public class NasaLogMapReduce extends Configured implements Tool {
     public static class TimeWindowMapper extends Mapper<LongWritable, Text, LongWritable, LongWritable> {
         private long firstEpoch;
         private long intervalSeconds;
+        private String batchMode;
+        private long firstYear;
+        private long firstMonth;
 
         @Override
         protected void setup(Context context) {
             firstEpoch = context.getConfiguration().getLong("nasa.batch.first.epoch", 0L);
             intervalSeconds = context.getConfiguration().getLong("nasa.batch.interval.seconds", 3600L);
+            batchMode = context.getConfiguration().get("nasa.batch.mode", "time");
+            firstYear = context.getConfiguration().getLong("nasa.batch.first.year", 0L);
+            firstMonth = context.getConfiguration().getLong("nasa.batch.first.month", 0L);
         }
 
         @Override
@@ -234,7 +246,14 @@ public class NasaLogMapReduce extends Configured implements Tool {
             if (parsed == null) {
                 return;
             }
-            long windowIndex = Math.floorDiv(parsed.epochSeconds - firstEpoch, intervalSeconds);
+            long windowIndex;
+            if ("calendar_month".equals(batchMode) && parsed.logDate != null && parsed.logDate.length() >= 7) {
+                long year = Integer.parseInt(parsed.logDate.substring(0, 4));
+                long month = Integer.parseInt(parsed.logDate.substring(5, 7));
+                windowIndex = (year - firstYear) * 12 + (month - firstMonth);
+            } else {
+                windowIndex = Math.floorDiv(parsed.epochSeconds - firstEpoch, intervalSeconds);
+            }
             context.write(new LongWritable(windowIndex), new LongWritable(1L));
         }
     }
@@ -558,7 +577,7 @@ public class NasaLogMapReduce extends Configured implements Tool {
 
         List<String> inputPaths = parsePathList(args[0]);
         String batchMode = args[1];
-        int batchValue = Integer.parseInt(args[2]);
+        long batchValue = "calendar_month".equals(batchMode) ? 0L : Long.parseLong(args[2]);
         String runUuid = args[3];
         String query = args.length >= 5 ? args[4] : "all";
         String aggregationMode = args.length >= 6 ? args[5] : "global";
@@ -610,7 +629,9 @@ public class NasaLogMapReduce extends Configured implements Tool {
         long malformedRecords = metadataJob.getCounters()
             .findCounter(PipelineCounter.MALFORMED_LINES)
             .getValue();
-        long firstEpoch = readMinEpoch(metadataOutput);
+        long firstEpoch = readMinEpoch(metadataOutput, "min_epoch");
+        long firstYear = readMinEpoch(metadataOutput, "min_year");
+        long firstMonth = readMinEpoch(metadataOutput, "min_month");
         Path batchMetadataOutput = new Path(baseOutput, "batch_metadata");
         Job batchMetadataJob = createJob(
             "nasa-batch-metadata",
@@ -619,8 +640,10 @@ public class NasaLogMapReduce extends Configured implements Tool {
             batchMetadataOutput
         );
         batchMetadataJob.getConfiguration().set("nasa.batch.mode", batchMode);
-        batchMetadataJob.getConfiguration().setLong("nasa.batch.value", batchValue);
+        batchMetadataJob.getConfiguration().setLong("nasa.batch.value", batchMode.equals("calendar_month") ? 0L : batchValue);
         batchMetadataJob.getConfiguration().setLong("nasa.batch.first.epoch", firstEpoch);
+        batchMetadataJob.getConfiguration().setLong("nasa.batch.first.year", firstYear);
+        batchMetadataJob.getConfiguration().setLong("nasa.batch.first.month", firstMonth);
         batchMetadataJob.setMapOutputKeyClass(Text.class);
         batchMetadataJob.setMapOutputValueClass(Text.class);
         batchMetadataJob.setOutputKeyClass(Text.class);
@@ -731,10 +754,10 @@ public class NasaLogMapReduce extends Configured implements Tool {
         }
     }
 
-    private long readMinEpoch(Path metadataOutput) throws IOException {
+    private long readMinEpoch(Path metadataOutput, String keyName) throws IOException {
         for (String line : readPartLines(metadataOutput)) {
             String[] parts = line.split("\\t", -1);
-            if (parts.length >= 2 && "min_epoch".equals(parts[0])) {
+            if (parts.length >= 2 && keyName.equals(parts[0])) {
                 return Long.parseLong(parts[1]);
             }
         }

@@ -88,7 +88,9 @@ FROM normalized;
 
 CREATE TABLE valid_epoch AS
 SELECT
-  min(unix_timestamp(concat(year_text, '-', month_num, '-', day_text, ' ', hour_text, ':', minute_text, ':', second_text), 'yyyy-MM-dd HH:mm:ss')) AS min_epoch
+  min(unix_timestamp(concat(year_text, '-', month_num, '-', day_text, ' ', hour_text, ':', minute_text, ':', second_text), 'yyyy-MM-dd HH:mm:ss')) AS min_epoch,
+  min(cast(year_text as int)) AS min_year,
+  min(cast(month_num as int)) AS min_month
 FROM normalized_validated
 WHERE is_valid = 1;
 
@@ -99,6 +101,11 @@ SELECT
     WHEN '${hivevar:BATCH_MODE}' = 'time' THEN
       CASE
         WHEN is_valid = 1 THEN floor(cast((unix_timestamp(concat(year_text, '-', month_num, '-', day_text, ' ', hour_text, ':', minute_text, ':', second_text), 'yyyy-MM-dd HH:mm:ss') - min_epoch) AS double) / cast(${hivevar:BATCH_VALUE} AS double)) + 1
+        ELSE 1
+      END
+    WHEN '${hivevar:BATCH_MODE}' = 'calendar_month' THEN
+      CASE
+        WHEN is_valid = 1 THEN ((cast(year_text as int) - min_year) * 12) + (cast(month_num as int) - min_month) + 1
         ELSE 1
       END
     ELSE floor(cast((record_number - 1) AS double) / cast(${hivevar:BATCH_VALUE} AS double)) + 1

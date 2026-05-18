@@ -168,7 +168,8 @@ build_pig_script
     -param "OUTPUT=$OUTPUT_DIR" \
     -param "UDF_PATH=$UDF_PATH" \
     -param "BATCH_VALUE=$BATCH_VALUE" \
-    -param "BATCH_BY_TIME=$([[ "$BATCH_MODE" == "time" ]] && echo 1 || echo 0)" \
+    -param "BATCH_BY_TIME=$([[ "$BATCH_MODE" == "time" || "$BATCH_MODE" == "calendar_month" ]] && echo 1 || echo 0)" \
+    -param "BATCH_MODE_STR=$BATCH_MODE" \
     -param "AGGREGATION_MODE=${AGGREGATION_MODE:-global}" \
     "$COMBINED_PIG"
 

@@ -611,6 +611,30 @@ function createTimeBatchAssigner(intervalSeconds) {
   };
 }
 
+function createCalendarMonthBatchAssigner() {
+  return {
+    minYear: null,
+    minMonth: null,
+    windows: new Map(),
+    assign(logDate) {
+      const [yearStr, monthStr] = logDate.split("-");
+      const year = parseInt(yearStr, 10);
+      const month = parseInt(monthStr, 10);
+      
+      if (this.minYear === null) {
+        this.minYear = year;
+        this.minMonth = month;
+      }
+      
+      const windowIndex = (year - this.minYear) * 12 + (month - this.minMonth) + 1;
+      if (!this.windows.has(windowIndex)) {
+        this.windows.set(windowIndex, this.windows.size + 1);
+      }
+      return this.windows.get(windowIndex);
+    },
+  };
+}
+
 async function runPipeline(
   logFilePaths,
   batchMode,
@@ -621,7 +645,18 @@ async function runPipeline(
   aggregationMode = "global"
 ) {
   const startTime = Date.now();
-  const isTimeBatching = batchMode === "time";
+  let isTimeBatching = false;
+  let isCalendarMonthBatching = false;
+  let timeBatcher = null;
+
+  if (batchMode === "time") {
+    isTimeBatching = true;
+    timeBatcher = createTimeBatchAssigner(batchValue);
+  } else if (batchMode === "calendar_month") {
+    isCalendarMonthBatching = true;
+    timeBatcher = createCalendarMonthBatchAssigner();
+  }
+
   const batchLabel = isTimeBatching
     ? `${batchValue} seconds`
     : `${batchValue} records`;
@@ -709,7 +744,7 @@ async function runPipeline(
 
     for await (const line of rl) {
       totalRecords++;
-      let rawBatchId = isTimeBatching
+      let rawBatchId = (isTimeBatching || isCalendarMonthBatching)
         ? activeBatchId
         : Math.floor((totalRecords - 1) / batchValue) + 1;
 
@@ -717,6 +752,8 @@ async function runPipeline(
 
       if (isTimeBatching && parsed) {
         rawBatchId = timeBatcher.assign(parsed.timestamp_epoch);
+      } else if (isCalendarMonthBatching && parsed) {
+        rawBatchId = timeBatcher.assign(parsed.logDate);
       }
 
       const stats = ensureBatchStats(rawBatchId);
@@ -805,7 +842,7 @@ async function runPipeline(
       runtimeSeconds,
       "completed",
       batchMode,
-      isTimeBatching ? batchValue : null,
+      isTimeBatching ? batchValue : (isCalendarMonthBatching ? null : batchValue),
       aggregationMode,
       runUuid,
     ]
@@ -855,8 +892,8 @@ if (args.length === 3) {
   [logFilePathArg, batchMode, batchValue, runUuid, query = "all", aggregationMode = "global"] = args;
 }
 
-if (!["records", "time"].includes(batchMode)) {
-  console.error("batch_mode must be either records or time");
+if (!["records", "time", "calendar_month"].includes(batchMode)) {
+  console.error("batch_mode must be either records, time, or calendar_month");
   process.exit(1);
 }
 if (!["all", "q1", "q2", "q3"].includes(query)) {
@@ -868,8 +905,8 @@ if (!["global", "per_batch"].includes(aggregationMode)) {
   process.exit(1);
 }
 
-const parsedBatchValue = parseInt(batchValue, 10);
-if (!Number.isInteger(parsedBatchValue) || parsedBatchValue <= 0) {
+const parsedBatchValue = batchMode === "calendar_month" ? 0 : parseInt(batchValue, 10);
+if (batchMode !== "calendar_month" && (!Number.isInteger(parsedBatchValue) || parsedBatchValue <= 0)) {
   console.error("batch_value must be a positive integer");
   process.exit(1);
 }

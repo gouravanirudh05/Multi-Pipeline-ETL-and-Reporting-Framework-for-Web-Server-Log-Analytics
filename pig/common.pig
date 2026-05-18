@@ -22,16 +22,27 @@ parsed_base = FOREACH ranked_lines GENERATE
     );
 
 valid_for_min = FILTER parsed_base BY parsed IS NOT NULL;
-valid_epochs = FOREACH valid_for_min GENERATE parsed.timestamp_epoch AS timestamp_epoch;
+valid_epochs = FOREACH valid_for_min GENERATE 
+    parsed.timestamp_epoch AS timestamp_epoch,
+    (int)SUBSTRING(parsed.log_date, 0, 4) AS log_year,
+    (int)SUBSTRING(parsed.log_date, 5, 7) AS log_month;
 epoch_group = GROUP valid_epochs ALL;
-min_epoch_rel = FOREACH epoch_group GENERATE MIN(valid_epochs.timestamp_epoch) AS min_epoch;
+min_epoch_rel = FOREACH epoch_group GENERATE 
+    MIN(valid_epochs.timestamp_epoch) AS min_epoch,
+    MIN(valid_epochs.log_year) AS min_year,
+    MIN(valid_epochs.log_month) AS min_month;
 parsed_crossed = CROSS parsed_base, min_epoch_rel;
 
 parsed_lines = FOREACH parsed_crossed GENERATE
     parsed_base::record_number AS record_number,
     ($BATCH_BY_TIME == 1 ?
         (parsed_base::parsed IS NULL ? 1 :
-            ((int)FLOOR(((double)(parsed_base::parsed.timestamp_epoch - min_epoch_rel::min_epoch)) / ((double)$BATCH_VALUE)) + 1))
+            ('$BATCH_MODE_STR' == 'calendar_month' ?
+                (((int)SUBSTRING(parsed_base::parsed.log_date, 0, 4) - min_epoch_rel::min_year) * 12) + ((int)SUBSTRING(parsed_base::parsed.log_date, 5, 7) - min_epoch_rel::min_month) + 1
+            :
+                ((int)FLOOR(((double)(parsed_base::parsed.timestamp_epoch - min_epoch_rel::min_epoch)) / ((double)$BATCH_VALUE)) + 1)
+            )
+        )
         :
         ((int)FLOOR(((double)(parsed_base::record_number - 1L)) / ((double)$BATCH_VALUE)) + 1)
     ) AS batch_id:int,

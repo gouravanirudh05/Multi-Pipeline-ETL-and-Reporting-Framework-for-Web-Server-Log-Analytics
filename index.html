@@ -575,7 +575,7 @@
           <label class="form-label">Time window batching</label>
           <select id="batch-interval" class="form-input">
             <option value="604800">1 Week</option>
-            <option value="2592000">1 Month</option>
+            <option value="calendar_month">1 Month</option>
           </select>
         </div>
       </div>
@@ -828,7 +828,20 @@ async function triggerRun() {
   if (isRunning || !selectedPipeline) return;
 
   const filesRaw  = document.getElementById("log-files").value.trim();
-  const batchIntervalSeconds = parseInt(document.getElementById("batch-interval").value) || 604800;
+  const batchIntervalValue = document.getElementById("batch-interval").value;
+  let batchMode = "time";
+  let batchIntervalSeconds = 604800;
+  let intervalLabel = "1 Week";
+  
+  if (batchIntervalValue === "calendar_month") {
+    batchMode = "calendar_month";
+    batchIntervalSeconds = 0;
+    intervalLabel = "1 Month";
+  } else {
+    batchIntervalSeconds = parseInt(batchIntervalValue) || 604800;
+    intervalLabel = (batchIntervalSeconds / 86400) + " days";
+  }
+  
   const query = document.getElementById("query-select").value || "all";
   const aggregationMode = document.getElementById("aggregation-mode").value || "global";
   const logFiles  = filesRaw.split("\n").map(s => s.trim()).filter(Boolean);
@@ -843,8 +856,7 @@ async function triggerRun() {
   const btn = document.getElementById("run-btn");
   btn.disabled = true;
   btn.textContent = "Running...";
-  const intervalDays = batchIntervalSeconds / 86400;
-  const batchLabel = `time_window=${intervalDays} days`;
+  const batchLabel = batchMode === "calendar_month" ? "calendar_month" : `time_window=${intervalLabel}`;
   document.getElementById("terminal-title").textContent =
     `[${selectedPipeline.toUpperCase()}]  ${batchLabel}`;
 
@@ -854,8 +866,8 @@ async function triggerRun() {
   appendLog(`  Files: ${logFiles.join(", ")}`, "info");
   appendLog(`  Query: ${query}`, "info");
   appendLog(`  Aggregation: ${aggregationMode}`, "info");
-  appendLog(`  Batch mode: time`, "info");
-  appendLog(`  Time window: ${intervalDays} days`, "info");
+  appendLog(`  Batch mode: ${batchMode}`, "info");
+  appendLog(`  Time window: ${intervalLabel}`, "info");
   appendLog("-".repeat(60), "info");
 
   const iv = animateProgress();
