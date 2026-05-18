@@ -584,10 +584,10 @@ public class NasaLogMapReduce extends Configured implements Tool {
 
         getConf().set("mapreduce.framework.name", "local");
 
-        if (!"records".equals(batchMode) && !"time".equals(batchMode)) {
-            throw new IllegalArgumentException("batch_mode must be records or time");
+        if (!"records".equals(batchMode) && !"time".equals(batchMode) && !"calendar_month".equals(batchMode)) {
+            throw new IllegalArgumentException("batch_mode must be records, time, or calendar_month");
         }
-        if (batchValue <= 0) {
+        if (!"calendar_month".equals(batchMode) && batchValue <= 0) {
             throw new IllegalArgumentException("batch_value must be greater than 0");
         }
         if (!"all".equals(query) && !"q1".equals(query) && !"q2".equals(query) && !"q3".equals(query)) {
